@@ -1,0 +1,176 @@
+// Read handler
+NTSTATUS GpuRead(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    
+    GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Read request received");
+    
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    return STATUS_SUCCESS;
+}
+
+// Write handler
+NTSTATUS GpuWrite(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    
+    GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Write request received");
+    
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    return STATUS_SUCCESS;
+}
+
+// Device control (IOCTL) handler
+NTSTATUS GpuDeviceControl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    ULONG controlCode = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    PVOID inputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    PVOID outputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    ULONG inputLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG outputLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG_PTR information = 0;
+    
+    GPU_LOG(DEBUG_VERBOSE, "Device control request: 0x%08X", controlCode);
+    
+    if (deviceExtension->DeviceRemovalPending) {
+        Irp->IoStatus.Status = STATUS_DELETE_PENDING;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DELETE_PENDING;
+    }
+    
+    switch (controlCode) {
+        case IOCTL_GPU_GET_INFO:
+            if (outputLength >= sizeof(GPU_INFO)) {
+                RtlCopyMemory(outputBuffer, &deviceExtension->GpuInfo, sizeof(GPU_INFO));
+                information = sizeof(GPU_INFO);
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+            
+        case IOCTL_GPU_GET_DRIVER_VERSION:
+            if (outputLength >= sizeof(GPU_DRIVER_VERSION)) {
+                PGPU_DRIVER_VERSION driverVersion = (PGPU_DRIVER_VERSION)outputBuffer;
+                RtlStringCbCopyA((PCHAR)driverVersion->Version, sizeof(driverVersion->Version), DRIVER_VERSION);
+                RtlStringCbCopyA((PCHAR)driverVersion->Date, sizeof(driverVersion->Date), DRIVER_DATE);
+                RtlStringCbCopyA((PCHAR)driverVersion->Vendor, sizeof(driverVersion->Vendor), DRIVER_VENDOR);
+                information = sizeof(GPU_DRIVER_VERSION);
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+            
+        case IOCTL_GPU_QUERY_PERFORMANCE:
+            if (outputLength >= sizeof(GPU_PERFORMANCE_DATA)) {
+                status = GetPerformanceData(deviceExtension, (PGPU_PERFORMANCE_DATA)outputBuffer);
+                information = sizeof(GPU_PERFORMANCE_DATA);
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+            
+        case IOCTL_GPU_GET_MEMORY_INFO:
+            if (outputLength >= sizeof(GPU_MEMORY_INFO)) {
+                status = GetGpuMemoryInfo(deviceExtension, (PGPU_MEMORY_INFO)outputBuffer);
+                information = sizeof(GPU_MEMORY_INFO);
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+            
+        default:
+            status = STATUS_NOT_SUPPORTED;
+            break;
+    }
+    
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = information;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    return status;
+}
+
+// Cleanup handler
+NTSTATUS GpuCleanup(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Cleanup request received");
+    
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    return STATUS_SUCCESS;
+}
+
+// Power handler
+NTSTATUS GpuPower(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    
+    GPU_LOG(DEBUG_VERBOSE, "Power IRP received: %d", irpStack->MinorFunction);
+    
+    // Pass power IRPs down the stack
+    IoCopyCurrentIrpStackLocationToNext(Irp);
+    return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+}
+
+// System control handler
+NTSTATUS GpuSystemControl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    
+    GPU_LOG_SIMPLE(DEBUG_VERBOSE, "System control IRP received");
+    
+    // Pass system control IRPs down the stack
+    IoCopyCurrentIrpStackLocationToNext(Irp);
+    return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+}
+
+// PnP handler
+NTSTATUS GpuPnP(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    GPU_LOG(DEBUG_INFO, "PnP IRP received: %d", irpStack->MinorFunction);
+    
+    switch (irpStack->MinorFunction) {
+        case IRP_MN_START_DEVICE:
+            status = GpuStartDevice(DeviceObject, Irp);
+            break;
+            
+        case IRP_MN_STOP_DEVICE:
+            status = GpuStopDevice(DeviceObject, Irp);
+            break;
+            
+        case IRP_MN_REMOVE_DEVICE:
+            status = GpuRemoveDevice(DeviceObject, Irp);
+            break;
+            
+        default:
+            IoCopyCurrentIrpStackLocationToNext(Irp);
+            return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+    }
+    
+    if (!NT_SUCCESS(status)) {
+        Irp->IoStatus.Status = status;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    }
+    
+    return status;
+}
