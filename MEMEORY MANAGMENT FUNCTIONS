@@ -1,0 +1,136 @@
+NTSTATUS InitializeMemoryManager(IN PDEVICE_EXTENSION DeviceExtension)
+{
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Initializing memory manager");
+    
+    // Initialize memory block list and lock
+    InitializeListHead(&DeviceExtension->MemoryBlockList);
+    KeInitializeSpinLock(&DeviceExtension->MemoryLock);
+    
+    // Initialize rundown protection for memory operations
+    ExInitializeRundownProtection(&DeviceExtension->MemoryRundown);
+    
+    // Create video memory mapping table
+    if (!NT_SUCCESS(CreateVideoMemoryMappingTable(DeviceExtension))) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to create memory mapping table");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    DeviceExtension->TotalAllocatedMemory = 0;
+    DeviceExtension->PeakAllocatedMemory = 0;
+    DeviceExtension->MemoryBlockCount = 0;
+    DeviceExtension->NextMemoryHandle = 1;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Memory manager initialized");
+    return STATUS_SUCCESS;
+}
+
+VOID CleanupMemoryManager(IN PDEVICE_EXTENSION DeviceExtension)
+{
+    PLIST_ENTRY entry;
+    PGPU_MEMORY_BLOCK memoryBlock;
+    KIRQL oldIrql;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Cleaning up memory manager");
+    
+    // Acquire rundown protection
+    if (!ExAcquireRundownProtection(&DeviceExtension->MemoryRundown)) {
+        return;
+    }
+    
+    KeAcquireSpinLock(&DeviceExtension->MemoryLock, &oldIrql);
+    
+    // Free all allocated memory blocks
+    while (!IsListEmpty(&DeviceExtension->MemoryBlockList)) {
+        entry = RemoveHeadList(&DeviceExtension->MemoryBlockList);
+        memoryBlock = CONTAINING_RECORD(entry, GPU_MEMORY_BLOCK, ListEntry);
+        
+        if (memoryBlock->Mdl) {
+            MmUnlockPages(memoryBlock->Mdl);
+            IoFreeMdl(memoryBlock->Mdl);
+        }
+        
+        if (memoryBlock->KernelVirtualAddress) {
+            ExFreePoolWithTag(memoryBlock->KernelVirtualAddress, GPU_MEMORY_TAG);
+        }
+        
+        ExFreePoolWithTag(memoryBlock, GPU_POOL_TAG);
+    }
+    
+    KeReleaseSpinLock(&DeviceExtension->MemoryLock, oldIrql);
+    
+    ExReleaseRundownProtection(&DeviceExtension->MemoryRundown);
+    
+    GPU_LOG(DEBUG_INFO, "Memory cleanup complete. Peak memory used: %lld bytes", 
+           DeviceExtension->PeakAllocatedMemory);
+}
+
+NTSTATUS AllocateGpuMemory(IN PDEVICE_EXTENSION DeviceExtension, 
+                          IN PGPU_ALLOCATE_REQUEST Request, 
+                          OUT PULONG64 MemoryHandle)
+{
+    PGPU_MEMORY_BLOCK memoryBlock;
+    KIRQL oldIrql;
+    PVOID allocation;
+    
+    if (!Request || !MemoryHandle) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    if (Request->Size == 0 || Request->Size > g_MaxMemoryMB * 1024 * 1024) {
+        GPU_LOG(DEBUG_ERROR, "Invalid memory size requested: %lu bytes", Request->Size);
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    // Check if we exceed max memory limit
+    if (DeviceExtension->TotalAllocatedMemory + Request->Size > g_MaxMemoryMB * 1024 * 1024) {
+        GPU_LOG(DEBUG_WARNING, "Memory allocation would exceed limit");
+        return STATUS_NO_MEMORY;
+    }
+    
+    // Allocate memory block structure
+    memoryBlock = (PGPU_MEMORY_BLOCK)ExAllocatePoolWithTag(NonPagedPool, 
+                                                           sizeof(GPU_MEMORY_BLOCK), 
+                                                           GPU_POOL_TAG);
+    if (!memoryBlock) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    RtlZeroMemory(memoryBlock, sizeof(GPU_MEMORY_BLOCK));
+    
+    // Allocate the actual GPU memory
+    allocation = ExAllocatePoolWithTag(NonPagedPool, Request->Size, GPU_MEMORY_TAG);
+    if (!allocation) {
+        ExFreePoolWithTag(memoryBlock, GPU_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    memoryBlock->KernelVirtualAddress = allocation;
+    memoryBlock->Size = Request->Size;
+    memoryBlock->Type = Request->Type;
+    memoryBlock->Flags = Request->Flags;
+    memoryBlock->InUse = TRUE;
+    memoryBlock->DeviceExtension = DeviceExtension;
+    memoryBlock->ReferenceCount = 1;
+    
+    KeAcquireSpinLock(&DeviceExtension->MemoryLock, &oldIrql);
+    
+    memoryBlock->ClientHandle = DeviceExtension->NextMemoryHandle++;
+    *MemoryHandle = memoryBlock->ClientHandle;
+    
+    InsertTailList(&DeviceExtension->MemoryBlockList, &memoryBlock->ListEntry);
+    
+    DeviceExtension->TotalAllocatedMemory += Request->Size;
+    if (DeviceExtension->TotalAllocatedMemory > DeviceExtension->PeakAllocatedMemory) {
+        DeviceExtension->PeakAllocatedMemory = DeviceExtension->TotalAllocatedMemory;
+    }
+    DeviceExtension->MemoryBlockCount++;
+    
+    KeReleaseSpinLock(&DeviceExtension->MemoryLock, oldIrql);
+    
+    GPU_LOG(DEBUG_INFO, "Allocated GPU memory: Handle=0x%llx Size=%lu Type=%d", 
+           *MemoryHandle, Request->Size, Request->Type);
+    
+    InterlockedIncrement(&g_TotalOperationsCompleted);
+    
+    return STATUS_SUCCESS;
+}
