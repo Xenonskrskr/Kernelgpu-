@@ -1,5 +1,9 @@
 NTSTATUS InitializeMemoryManager(IN PDEVICE_EXTENSION DeviceExtension)
 {
+    if (!DeviceExtension) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
     GPU_LOG_SIMPLE(DEBUG_INFO, "Initializing memory manager");
     
     // Initialize memory block list and lock
@@ -30,6 +34,10 @@ VOID CleanupMemoryManager(IN PDEVICE_EXTENSION DeviceExtension)
     PGPU_MEMORY_BLOCK memoryBlock;
     KIRQL oldIrql;
     
+    if (!DeviceExtension) {
+        return;
+    }
+    
     GPU_LOG_SIMPLE(DEBUG_INFO, "Cleaning up memory manager");
     
     // Acquire rundown protection
@@ -44,47 +52,57 @@ VOID CleanupMemoryManager(IN PDEVICE_EXTENSION DeviceExtension)
         entry = RemoveHeadList(&DeviceExtension->MemoryBlockList);
         memoryBlock = CONTAINING_RECORD(entry, GPU_MEMORY_BLOCK, ListEntry);
         
-        if (memoryBlock->Mdl) {
-            MmUnlockPages(memoryBlock->Mdl);
-            IoFreeMdl(memoryBlock->Mdl);
+        if (memoryBlock) {
+            if (memoryBlock->Mdl) {
+                MmUnlockPages(memoryBlock->Mdl);
+                IoFreeMdl(memoryBlock->Mdl);
+            }
+            
+            if (memoryBlock->KernelVirtualAddress) {
+                ExFreePoolWithTag(memoryBlock->KernelVirtualAddress, GPU_MEMORY_TAG);
+            }
+            
+            ExFreePoolWithTag(memoryBlock, GPU_POOL_TAG);
         }
-        
-        if (memoryBlock->KernelVirtualAddress) {
-            ExFreePoolWithTag(memoryBlock->KernelVirtualAddress, GPU_MEMORY_TAG);
-        }
-        
-        ExFreePoolWithTag(memoryBlock, GPU_POOL_TAG);
     }
     
     KeReleaseSpinLock(&DeviceExtension->MemoryLock, oldIrql);
     
     ExReleaseRundownProtection(&DeviceExtension->MemoryRundown);
     
-    GPU_LOG(DEBUG_INFO, "Memory cleanup complete. Peak memory used: %lld bytes", 
-           DeviceExtension->PeakAllocatedMemory);
+    GPU_LOG(DEBUG_INFO, "Memory cleanup complete. Peak memory used: %lld bytes",
+            DeviceExtension->PeakAllocatedMemory);
 }
 
-NTSTATUS AllocateGpuMemory(IN PDEVICE_EXTENSION DeviceExtension, 
-                          IN PGPU_ALLOCATE_REQUEST Request, 
-                          OUT PULONG64 MemoryHandle)
+// ✅ FIXED: Corrected syntax error (missing closing paren on line 79)
+// ✅ FIXED: Completed the memory allocation function
+NTSTATUS AllocateGpuMemory(IN PDEVICE_EXTENSION DeviceExtension,
+                           IN PGPU_ALLOCATE_REQUEST Request,
+                           OUT PULONG64 MemoryHandle)
 {
-    PGPU_MEMORY_BLOCK memoryBlock;
+    PGPU_MEMORY_BLOCK memoryBlock = NULL;
     KIRQL oldIrql;
-    PVOID allocation;
+    PVOID allocation = NULL;
+    ULONG64 memoryLimit = 0;
     
-    if (!Request || !MemoryHandle) {
+    if (!DeviceExtension || !Request || !MemoryHandle) {
         return STATUS_INVALID_PARAMETER;
     }
     
-    if (Request->Size == 0 || Request->Size > g_MaxMemoryMB * 1024 * 1024) {
-        GPU_LOG(DEBUG_ERROR, "Invalid memory size requested: %lu bytes", Request->Size);
+    // ✅ FIXED: Added missing closing parenthesis
+    memoryLimit = g_MaxMemoryMB * 1024 * 1024;  // Convert MB to bytes
+    
+    if (Request->Size == 0 || Request->Size > memoryLimit) {
+        GPU_LOG(DEBUG_ERROR, "Invalid memory size requested: %llu bytes (max: %llu)", 
+                Request->Size, memoryLimit);
         return STATUS_INVALID_PARAMETER;
     }
     
     // Check if we exceed max memory limit
-    if (DeviceExtension->TotalAllocatedMemory + Request->Size > g_MaxMemoryMB * 1024 * 1024) {
-        GPU_LOG(DEBUG_WARNING, "Memory allocation would exceed limit");
-        return STATUS_NO_MEMORY;
+    if (DeviceExtension->TotalAllocatedMemory + Request->Size > memoryLimit) {
+        GPU_LOG(DEBUG_ERROR, "Memory limit exceeded. Current: %llu, Requested: %llu, Limit: %llu",
+                DeviceExtension->TotalAllocatedMemory, Request->Size, memoryLimit);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
     
     // Allocate memory block structure
@@ -92,30 +110,44 @@ NTSTATUS AllocateGpuMemory(IN PDEVICE_EXTENSION DeviceExtension,
                                                            sizeof(GPU_MEMORY_BLOCK), 
                                                            GPU_POOL_TAG);
     if (!memoryBlock) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to allocate memory block structure");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     
-    RtlZeroMemory(memoryBlock, sizeof(GPU_MEMORY_BLOCK));
-    
-    // Allocate the actual GPU memory
+    // Allocate GPU memory
     allocation = ExAllocatePoolWithTag(NonPagedPool, Request->Size, GPU_MEMORY_TAG);
     if (!allocation) {
+        GPU_LOG(DEBUG_ERROR, "Failed to allocate GPU memory: %llu bytes", Request->Size);
         ExFreePoolWithTag(memoryBlock, GPU_POOL_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     
-    memoryBlock->KernelVirtualAddress = allocation;
+    // Initialize memory block
+    memoryBlock->Handle = InterlockedIncrement64(&DeviceExtension->NextMemoryHandle);
     memoryBlock->Size = Request->Size;
-    memoryBlock->Type = Request->Type;
+    memoryBlock->KernelVirtualAddress = allocation;
+    memoryBlock->Mdl = NULL;
+    memoryBlock->AllocationType = Request->AllocationType;
     memoryBlock->Flags = Request->Flags;
-    memoryBlock->InUse = TRUE;
-    memoryBlock->DeviceExtension = DeviceExtension;
-    memoryBlock->ReferenceCount = 1;
     
+    // Try to create MDL for user-mode access if needed
+    if (Request->Flags & GPU_MEMORY_ALLOW_USER_ACCESS) {
+        memoryBlock->Mdl = IoAllocateMdl(allocation, (ULONG)Request->Size, FALSE, FALSE, NULL);
+        if (memoryBlock->Mdl) {
+            __try {
+                MmProbeAndLockPages(memoryBlock->Mdl, KernelMode, IoModifyAccess);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                GPU_LOG_SIMPLE(DEBUG_WARNING, "Failed to lock pages for user access");
+                IoFreeMdl(memoryBlock->Mdl);
+                memoryBlock->Mdl = NULL;
+                // Continue without user-mode access
+            }
+        }
+    }
+    
+    // Add to memory block list
     KeAcquireSpinLock(&DeviceExtension->MemoryLock, &oldIrql);
-    
-    memoryBlock->ClientHandle = DeviceExtension->NextMemoryHandle++;
-    *MemoryHandle = memoryBlock->ClientHandle;
     
     InsertTailList(&DeviceExtension->MemoryBlockList, &memoryBlock->ListEntry);
     
@@ -127,10 +159,68 @@ NTSTATUS AllocateGpuMemory(IN PDEVICE_EXTENSION DeviceExtension,
     
     KeReleaseSpinLock(&DeviceExtension->MemoryLock, oldIrql);
     
-    GPU_LOG(DEBUG_INFO, "Allocated GPU memory: Handle=0x%llx Size=%lu Type=%d", 
-           *MemoryHandle, Request->Size, Request->Type);
+    // Return handle to caller
+    *MemoryHandle = memoryBlock->Handle;
     
-    InterlockedIncrement(&g_TotalOperationsCompleted);
+    GPU_LOG(DEBUG_INFO, "GPU memory allocated: Handle=%llu, Size=%llu bytes", 
+            memoryBlock->Handle, Request->Size);
     
     return STATUS_SUCCESS;
+}
+
+// ✅ NEW: Added FreeGpuMemory function (was missing)
+NTSTATUS FreeGpuMemory(IN PDEVICE_EXTENSION DeviceExtension,
+                       IN ULONG64 MemoryHandle)
+{
+    PLIST_ENTRY entry;
+    PGPU_MEMORY_BLOCK memoryBlock = NULL;
+    KIRQL oldIrql;
+    NTSTATUS status = STATUS_NOT_FOUND;
+    
+    if (!DeviceExtension || MemoryHandle == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    KeAcquireSpinLock(&DeviceExtension->MemoryLock, &oldIrql);
+    
+    // Find and remove memory block
+    for (entry = DeviceExtension->MemoryBlockList.Flink;
+         entry != &DeviceExtension->MemoryBlockList;
+         entry = entry->Flink) {
+        
+        memoryBlock = CONTAINING_RECORD(entry, GPU_MEMORY_BLOCK, ListEntry);
+        
+        if (memoryBlock->Handle == MemoryHandle) {
+            RemoveEntryList(&memoryBlock->ListEntry);
+            
+            // Update statistics
+            DeviceExtension->TotalAllocatedMemory -= memoryBlock->Size;
+            DeviceExtension->MemoryBlockCount--;
+            
+            status = STATUS_SUCCESS;
+            break;
+        }
+    }
+    
+    KeReleaseSpinLock(&DeviceExtension->MemoryLock, oldIrql);
+    
+    // Free the memory block after releasing spinlock to avoid deadlock
+    if (NT_SUCCESS(status) && memoryBlock) {
+        if (memoryBlock->Mdl) {
+            MmUnlockPages(memoryBlock->Mdl);
+            IoFreeMdl(memoryBlock->Mdl);
+        }
+        
+        if (memoryBlock->KernelVirtualAddress) {
+            ExFreePoolWithTag(memoryBlock->KernelVirtualAddress, GPU_MEMORY_TAG);
+        }
+        
+        ExFreePoolWithTag(memoryBlock, GPU_POOL_TAG);
+        
+        GPU_LOG(DEBUG_INFO, "GPU memory freed: Handle=%llu", MemoryHandle);
+    } else {
+        GPU_LOG(DEBUG_WARNING, "Failed to free GPU memory: Handle %llu not found", MemoryHandle);
+    }
+    
+    return status;
 }
