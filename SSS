@@ -1,0 +1,3836 @@
+/*
+ * Advanced NVIDIA GPU Driver for Windows 10 64-bit
+ * Version: 2.5.0
+ * Date: 2025-07-01
+ * 
+ * Specifically optimized for NVIDIA GTX 1070
+ * Last updated: 2025-07-01 09:05:15 UTC
+ * Author: XenonskrskrSEH
+ */
+
+#include <ntddk.h>
+#include <wdm.h>
+#include <ntstrsafe.h>
+#include <wdmguid.h>  // For GUID_BUS_INTERFACE_STANDARD
+#include <initguid.h> // For GUID definitions
+#include <ntddvdeo.h>
+
+// Define driver version info
+#define DRIVER_VERSION "2.5.0"
+#define DRIVER_DATE "2025-07-01"
+#define DRIVER_VENDOR "Advanced Driver Development"
+
+// Debug levels
+#define DEBUG_ERROR   0
+#define DEBUG_WARNING 1
+#define DEBUG_INFO    2
+#define DEBUG_VERBOSE 3
+
+// Global debug level
+ULONG g_DebugLevel = DEBUG_INFO;
+
+// Maximum memory usage in MB (configurable via registry)
+ULONG g_MaxMemoryMB = 4096; // Default 4GB limit
+
+// Global performance counters
+volatile LONG64 g_TotalBytesTransferred = 0;
+volatile LONG g_TotalOperationsCompleted = 0;
+volatile LONG g_TotalErrorCount = 0;
+LARGE_INTEGER g_DriverStartTime;
+
+// Debug print macro
+#define GPU_LOG(Level, Format, ...) \
+    if (g_DebugLevel >= (Level)) { \
+        DbgPrintEx(DPFLTR_IHVVIDEO_ID, DPFLTR_INFO_LEVEL, \
+                  "NvidiaGpuDriver: " Format "\n", __VA_ARGS__); \
+    }
+
+#define GPU_LOG_SIMPLE(Level, Text) \
+    if (g_DebugLevel >= (Level)) { \
+        DbgPrintEx(DPFLTR_IHVVIDEO_ID, DPFLTR_INFO_LEVEL, \
+                  "NvidiaGpuDriver: %s\n", Text); \
+    }
+
+// Define GPU-specific IOCTL codes
+#define IOCTL_GPU_GET_INFO            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_ALLOCATE_MEMORY     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_FREE_MEMORY         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_MAP_MEMORY_TO_USER  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_UNMAP_MEMORY        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_EXECUTE_COMMAND     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_QUERY_PERFORMANCE   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_SET_POWER_STATE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_WAIT_COMMAND        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_GET_DRIVER_VERSION  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_SET_CLOCK_SPEEDS    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_SET_FAN_SPEED       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GPU_GET_MEMORY_INFO     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Custom pool tags for memory allocation tracking
+#define GPU_POOL_TAG                 'UPGN'  // "NGPU" backward
+#define GPU_MEMORY_TAG               'MPGN'  // "NGPM" backward
+#define GPU_COMMAND_TAG              'CPGN'  // "NGPC" backward
+#define GPU_IRQ_TAG                  'IPGN'  // "NGPI" backward
+#define GPU_WORK_TAG                 'WPGN'  // "NGPW" backward
+
+// NVIDIA GTX 1070 specific information
+#define NVIDIA_VENDOR_ID            0x10DE
+#define NVIDIA_GTX1070_DEVICE_ID    0x1B81  // Main GTX 1070 ID
+#define NVIDIA_GTX1070_DEVICE_ID2   0x1B82  // Another possible variant
+#define NVIDIA_GTX1070_DEVICE_ID3   0x1B83  // Another possible variant
+
+// Constants for hardware protection
+#define GPU_MAX_COMMAND_SIZE          (1024 * 1024)  // 1MB max command size
+#define GPU_MAX_MEMORY_BLOCKS         256            // Max memory blocks
+#define GPU_COMMAND_TIMEOUT_MS        5000           // 5 second command timeout
+#define GPU_INIT_TIMEOUT_MS           10000          // 10 second init timeout
+#define GPU_MAX_REGISTER_SIZE         (16 * 1024 * 1024) // 16MB max register space
+#define GPU_MAX_TEMP_THRESHOLD        95             // 95°C max temperature
+#define GPU_WATCHDOG_INTERVAL_MS      1000           // 1 second watchdog interval
+
+// PCI Configuration Space registers
+#define PCI_CONFIG_VENDOR_ID          0x00   // Vendor ID Register
+#define PCI_CONFIG_DEVICE_ID          0x02   // Device ID Register
+#define PCI_CONFIG_COMMAND            0x04   // Command Register
+#define PCI_CONFIG_STATUS             0x06   // Status Register
+#define PCI_CONFIG_REVISION_ID        0x08   // Revision ID Register
+#define PCI_CONFIG_PROG_IF            0x09   // Programming Interface
+#define PCI_CONFIG_SUBCLASS           0x0A   // Sub-Class Code
+#define PCI_CONFIG_BASECLASS          0x0B   // Base Class Code
+#define PCI_CONFIG_CACHE_LINE_SIZE    0x0C   // Cache Line Size
+#define PCI_CONFIG_LATENCY_TIMER      0x0D   // Latency Timer
+#define PCI_CONFIG_HEADER_TYPE        0x0E   // Header Type
+#define PCI_CONFIG_BIST               0x0F   // Built-in Self Test
+#define PCI_CONFIG_BAR0               0x10   // Base Address Register 0
+#define PCI_CONFIG_BAR1               0x14   // Base Address Register 1
+#define PCI_CONFIG_BAR2               0x18   // Base Address Register 2
+#define PCI_CONFIG_BAR3               0x1C   // Base Address Register 3
+#define PCI_CONFIG_BAR4               0x20   // Base Address Register 4
+#define PCI_CONFIG_BAR5               0x24   // Base Address Register 5
+#define PCI_CONFIG_SUBSYS_VENDOR_ID   0x2C   // Subsystem Vendor ID
+#define PCI_CONFIG_SUBSYS_ID          0x2E   // Subsystem ID
+#define PCI_CONFIG_INTERRUPT_LINE     0x3C   // Interrupt Line
+#define PCI_CONFIG_INTERRUPT_PIN      0x3D   // Interrupt Pin
+
+// PCI Command Register bits
+#define PCI_COMMAND_IO_ENABLE         0x0001 // I/O Access Enable
+#define PCI_COMMAND_MEM_ENABLE        0x0002 // Memory Access Enable
+#define PCI_COMMAND_MASTER_ENABLE     0x0004 // Bus Master Enable
+#define PCI_COMMAND_SPECIAL_ENABLE    0x0008 // Special Cycles Enable
+#define PCI_COMMAND_INVALIDATE_ENABLE 0x0010 // Memory Write and Invalidate Enable
+#define PCI_COMMAND_PALETTE_ENABLE    0x0020 // Palette Snooping Enable
+#define PCI_COMMAND_PARITY_ENABLE     0x0040 // Parity Error Response Enable
+#define PCI_COMMAND_SERR_ENABLE       0x0100 // SERR# Enable
+#define PCI_COMMAND_FAST_BACK_ENABLE  0x0200 // Fast Back-to-Back Enable
+
+// BAR flags and masks
+#define PCI_BAR_TYPE_MASK             0x00000001  // Memory or I/O
+#define PCI_BAR_TYPE_MEMORY           0x00000000
+#define PCI_BAR_TYPE_IO               0x00000001
+#define PCI_BAR_MEMORY_TYPE_MASK      0x00000006  // Memory type
+#define PCI_BAR_MEMORY_TYPE_32BIT     0x00000000  // 32-bit BAR
+#define PCI_BAR_MEMORY_TYPE_1M        0x00000002  // Below 1MB
+#define PCI_BAR_MEMORY_TYPE_64BIT     0x00000004  // 64-bit BAR
+#define PCI_BAR_MEMORY_PREFETCH       0x00000008  // Prefetchable memory
+#define PCI_BAR_IO_MASK               0xFFFFFFFC  // I/O address mask
+#define PCI_BAR_MEM_MASK              0xFFFFFFF0  // Memory address mask
+
+// NVIDIA Pascal GPU Register Map
+#define NV_PASCAL_PMC_BOOT_0                     0x00000000
+#define NV_PASCAL_PMC_INTR_0                     0x00000100
+#define NV_PASCAL_PMC_INTR_EN_0                  0x00000140
+#define NV_PASCAL_PMC_ENABLE                     0x00000200
+#define NV_PASCAL_PTIMER_TIME_0                  0x00009400
+#define NV_PASCAL_PTIMER_TIME_1                  0x00009410
+
+// Memory Controller Registers
+#define NV_PASCAL_MC_INTR_0                      0x00000180
+#define NV_PASCAL_MC_INTR_EN_0                   0x00000184
+#define NV_PASCAL_MC_INTR_MASK_0                 0x00000188
+
+// Graphics Engine Registers
+#define NV_PASCAL_PGRAPH_STATUS                  0x00400700
+#define NV_PASCAL_PGRAPH_INTR                    0x00400100
+#define NV_PASCAL_PGRAPH_INTR_EN                 0x00400140
+
+// Memory Interface Registers
+#define NV_PASCAL_FB_MMU_STATUS                  0x00100800
+#define NV_PASCAL_FB_NISO_INTR_STATUS            0x00001010
+
+// Clock Control Registers
+#define NV_PASCAL_CLOCK_CONTROL                  0x00020000
+#define NV_PASCAL_THERMAL_SENSOR                 0x00020400
+#define NV_PASCAL_POWER_MANAGEMENT               0x00020800
+#define NV_PASCAL_FAN_CONTROL                    0x00021000
+
+// Pascal GPU Register Values
+#define NV_PASCAL_PMC_ENABLE_VALUE               0x00000001
+#define NV_PASCAL_INTR_RESET_VALUE               0xFFFFFFFF
+
+// Memory flags
+#define GPU_MEMORY_FLAG_WRITE_COMBINED 0x00000001  // Use write-combined memory
+#define GPU_MEMORY_FLAG_CACHED         0x00000002  // Use cached memory
+#define GPU_MEMORY_FLAG_NON_PAGED      0x00000004  // Use non-paged memory
+#define GPU_MEMORY_FLAG_ZERO_INIT      0x00000008  // Zero-initialize memory
+#define GPU_MEMORY_FLAG_SHARED         0x00000010  // Shared with other drivers
+#define GPU_MEMORY_FLAG_PROTECTED      0x00000020  // Protected memory
+#define GPU_MEMORY_FLAG_READ_ONLY      0x00000040  // Read-only memory
+#define GPU_MEMORY_FLAG_NO_EVICT       0x00000080  // Do not evict memory
+
+// Memory types for GPU allocation
+typedef enum _GPU_MEMORY_TYPE {
+    GpuMemoryTypeSystem = 0,    // System memory accessible to GPU
+    GpuMemoryTypeLocal,         // Local GPU memory (VRAM)
+    GpuMemoryTypeAGP,           // AGP/PCIE memory
+    GpuMemoryTypeUMA,           // Unified memory architecture
+    GpuMemoryTypeMax
+} GPU_MEMORY_TYPE;
+
+// GPU power states
+typedef enum _GPU_POWER_STATE {
+    GpuPowerStateD0 = 0,   // Full power
+    GpuPowerStateD1,       // Low power
+    GpuPowerStateD2,       // Standby
+    GpuPowerStateD3,       // Off
+    GpuPowerStateMax
+} GPU_POWER_STATE;
+
+// Command types that can be submitted to the GPU
+typedef enum _GPU_COMMAND_TYPE {
+    GpuCommandRender = 0,       // 3D rendering command
+    GpuCommandBlit,             // 2D blit operation
+    GpuCommandCompute,          // Compute shader execution
+    GpuCommandPresent,          // Present frame to display
+    GpuCommandSystemControl,    // System control command
+    GpuCommandVideoEncode,      // Video encode operation
+    GpuCommandVideoDecode,      // Video decode operation
+    GpuCommandMax
+} GPU_COMMAND_TYPE;
+
+// Command status
+typedef enum _GPU_COMMAND_STATUS {
+    GpuCommandStatusPending = 0,  // Command submitted, not processed
+    GpuCommandStatusRunning,      // Command being processed
+    GpuCommandStatusComplete,     // Command completed successfully
+    GpuCommandStatusError,        // Command completed with errors
+    GpuCommandStatusTimeout,      // Command timed out
+    GpuCommandStatusCancelled,    // Command was cancelled
+    GpuCommandStatusMax
+} GPU_COMMAND_STATUS;
+
+// GPU status flags
+#define GPU_STATUS_INITIALIZED     0x00000001  // Driver initialized
+#define GPU_STATUS_POWERED_ON      0x00000002  // GPU powered on
+#define GPU_STATUS_ERROR           0x00000004  // GPU in error state
+#define GPU_STATUS_SUSPENDED       0x00000008  // GPU suspended
+#define GPU_STATUS_COMMAND_ACTIVE  0x00000010  // Command in progress
+#define GPU_STATUS_SAFE_MODE       0x00000020  // Operating in safe mode
+#define GPU_STATUS_OVERHEATING     0x00000040  // GPU temperature too high
+#define GPU_STATUS_MEMORY_LOW      0x00000080  // Low on memory
+#define GPU_STATUS_HUNG            0x00000100  // GPU appears hung
+
+// GPU capability flags
+#define GPU_CAPS_3D_ACCELERATION   0x00000001  // Support for 3D acceleration
+#define GPU_CAPS_2D_ACCELERATION   0x00000002  // Support for 2D acceleration
+#define GPU_CAPS_COMPUTE           0x00000004  // Support for compute operations
+#define GPU_CAPS_VIDEO_DECODE      0x00000008  // Support for video decoding
+#define GPU_CAPS_VIDEO_ENCODE      0x00000010  // Support for video encoding
+#define GPU_CAPS_MULTI_DISPLAY     0x00000020  // Support for multiple displays
+#define GPU_CAPS_UNIFIED_MEMORY    0x00000040  // Support for unified memory architecture
+#define GPU_CAPS_OVERCLOCK         0x00000080  // Support for overclocking
+#define GPU_CAPS_FAN_CONTROL       0x00000100  // Support for fan control
+#define GPU_CAPS_POWER_CONTROL     0x00000200  // Support for power control
+#define GPU_CAPS_TEMP_MONITORING   0x00000400  // Support for temperature monitoring
+#define GPU_CAPS_PERF_STATES       0x00000800  // Support for performance states
+
+// Forward declarations for structures
+typedef struct _DEVICE_EXTENSION DEVICE_EXTENSION, *PDEVICE_EXTENSION;
+typedef struct _GPU_MEMORY_BLOCK GPU_MEMORY_BLOCK, *PGPU_MEMORY_BLOCK;
+typedef struct _GPU_COMMAND_BUFFER GPU_COMMAND_BUFFER, *PGPU_COMMAND_BUFFER;
+
+// Define GPU memory structure
+typedef struct _GPU_MEMORY_BLOCK {
+    LIST_ENTRY ListEntry;
+    PVOID KernelVirtualAddress;
+    PHYSICAL_ADDRESS PhysicalAddress;
+    PVOID UserVirtualAddress;  // If mapped to user-mode
+    PMDL Mdl;                  // MDL for the memory block
+    ULONG Size;
+    GPU_MEMORY_TYPE Type;
+    ULONG Flags;
+    BOOLEAN InUse;
+    ULONG64 ClientHandle;      // Handle returned to user mode
+    volatile LONG ReferenceCount;  // Reference count for tracking use
+    PDEVICE_EXTENSION DeviceExtension; // Back-pointer to device
+    ULONG64 GpuAddress;        // GPU virtual address (if mapped to GPU)
+    PVOID MappingInfo;         // Additional mapping information
+} GPU_MEMORY_BLOCK, *PGPU_MEMORY_BLOCK;
+
+// Structure for command submission
+typedef struct _GPU_COMMAND_BUFFER {
+    LIST_ENTRY ListEntry;
+    GPU_COMMAND_TYPE CommandType;
+    PVOID CommandData;
+    ULONG CommandSize;
+    ULONG64 CommandId;        // Unique ID for tracking
+    volatile GPU_COMMAND_STATUS Status;  // Command status
+    NTSTATUS CompletionStatus;
+    LARGE_INTEGER SubmissionTime; // When the command was submitted
+    LARGE_INTEGER CompletionTime; // When the command completed
+    KEVENT CompletionEvent;      // Event signaled on completion
+    volatile LONG ReferenceCount; // Reference count for tracking use
+    PDEVICE_EXTENSION DeviceExtension; // Back-pointer to device
+    PGPU_MEMORY_BLOCK CommandMemory; // Memory block containing command data
+    ULONG TimeoutMs;           // Command timeout in milliseconds
+    PVOID CompletionContext;   // Context for command completion
+    ULONG CompletionFlags;     // Flags for command completion
+    PVOID PrivateData;         // Driver-private data for this command
+} GPU_COMMAND_BUFFER, *PGPU_COMMAND_BUFFER;
+
+// Define GPU info structure returned to user mode
+typedef struct _GPU_INFO {
+    // Identification
+    UCHAR VendorName[32];
+    UCHAR DeviceName[64];
+    USHORT VendorId;
+    USHORT DeviceId;
+    UCHAR RevisionId;
+    USHORT SubsystemVendorId;
+    USHORT SubsystemId;
+    
+    // Memory information
+    ULONG64 TotalLocalMemory;   // Local memory in bytes
+    ULONG64 AvailableLocalMemory; // Available memory in bytes
+    
+    // Clock information
+    ULONG CoreClockKHz;         // Core clock in KHz
+    ULONG MemoryClockKHz;       // Memory clock in KHz
+    
+    // Capabilities
+    ULONG Capabilities;         // Capability flags
+    
+    // Temperature and power info
+    ULONG TemperatureCentigrade;
+    ULONG PowerConsumptionMilliwatts;
+    
+    // Current state
+    GPU_POWER_STATE PowerState;
+    ULONG UtilizationPercentage;
+    
+    // NVIDIA GTX 1070 specific info
+    ULONG CudaCores;            // Number of CUDA cores
+    ULONG BoostClockKHz;        // GPU boost clock
+    ULONG MemoryBusWidth;       // Memory bus width in bits
+    ULONG ROPs;                 // Number of Render Output Units
+    ULONG TMUs;                 // Number of Texture Mapping Units
+    
+    // Driver info
+    UCHAR DriverVersion[16];    // Driver version string
+    ULONG DriverFeatureLevel;   // Driver feature level
+    ULONG DriverFlags;          // Driver flags
+    ULONG GpuStatusFlags;       // GPU status flags
+    
+    // PCI Express information
+    ULONG PCIeLinkWidth;        // PCIe link width (e.g., x16)
+    ULONG PCIeLinkSpeed;        // PCIe link speed (Gen1=1, Gen2=2, Gen3=3)
+    
+    // Fan information
+    ULONG FanSpeedRPM;          // Fan speed in RPM
+    ULONG FanSpeedPercentage;   // Fan speed as percentage of maximum
+    
+    // Reserved for future use
+    ULONG Reserved[4];
+} GPU_INFO, *PGPU_INFO;
+
+// Structure for driver version info
+typedef struct _GPU_DRIVER_VERSION {
+    UCHAR Version[16];             // Version string (e.g., "2.5.0")
+    UCHAR Date[16];                // Date string (e.g., "2025-07-01")
+    UCHAR Vendor[32];              // Vendor name
+    ULONG MajorVersion;            // Major version number
+    ULONG MinorVersion;            // Minor version number
+    ULONG PatchVersion;            // Patch version number
+    ULONG BuildNumber;             // Build number
+    ULONG Reserved[8];             // Reserved for future use
+} GPU_DRIVER_VERSION, *PGPU_DRIVER_VERSION;
+
+// Structure for memory allocation request
+typedef struct _GPU_ALLOCATE_REQUEST {
+    ULONG Size;
+    GPU_MEMORY_TYPE Type;
+    ULONG Flags;
+    ULONG64 ResultHandle;  // Output: Handle to allocated memory
+    ULONG Alignment;       // Alignment requirement (0 for default)
+    ULONG Reserved[3];     // Reserved for future use
+} GPU_ALLOCATE_REQUEST, *PGPU_ALLOCATE_REQUEST;
+
+// Structure for memory free request
+typedef struct _GPU_FREE_REQUEST {
+    ULONG64 Handle;  // Handle of memory block to free
+} GPU_FREE_REQUEST, *PGPU_FREE_REQUEST;
+
+// Structure for memory mapping request
+typedef struct _GPU_MAP_MEMORY_REQUEST {
+    ULONG64 Handle;       // Handle of memory block to map
+    PVOID UserAddress;    // Output: Mapped user address
+    BOOLEAN WriteAccess;  // TRUE for write access
+    ULONG Reserved[3];    // Reserved for future use
+} GPU_MAP_MEMORY_REQUEST, *PGPU_MAP_MEMORY_REQUEST;
+
+// Structure for command execution
+typedef struct _GPU_EXECUTE_COMMAND {
+    GPU_COMMAND_TYPE CommandType;
+    ULONG CommandSize;
+    ULONG64 CommandId;     // Output: Assigned command ID
+    ULONG Flags;
+    ULONG TimeoutMs;
+    ULONG Reserved[2];
+    UCHAR CommandData[1];  // Variable size command data
+} GPU_EXECUTE_COMMAND, *PGPU_EXECUTE_COMMAND;
+
+// Structure for command wait request
+typedef struct _GPU_WAIT_COMMAND_REQUEST {
+    ULONG64 CommandId;             // Command ID to wait for
+    ULONG TimeoutMs;               // Timeout in milliseconds (0 = wait forever)
+    GPU_COMMAND_STATUS Status;     // Output: Command status
+    NTSTATUS CompletionStatus;     // Output: Command completion status
+    ULONG Reserved[2];             // Reserved for future use
+} GPU_WAIT_COMMAND_REQUEST, *PGPU_WAIT_COMMAND_REQUEST;
+
+// Structure for performance query
+typedef struct _GPU_PERFORMANCE_DATA {
+    ULONG UtilizationPercentage;
+    ULONG TemperatureCentigrade;
+    ULONG PowerConsumptionMilliwatts;
+    ULONG CoreClockKHz;
+    ULONG MemoryClockKHz;
+    ULONG MemoryUtilizationPercentage;
+    ULONG FanSpeedPercentage;
+    ULONG EngineUtilization[4];   // Up to 4 different engines
+    ULONG64 MemoryUsedBytes;
+    ULONG64 CommandsProcessed;
+    ULONG64 CommandsErrored;
+    ULONG64 TotalUptime;          // Total driver uptime in seconds
+    ULONG Reserved[8];            // Reserved for future use
+} GPU_PERFORMANCE_DATA, *PGPU_PERFORMANCE_DATA;
+
+// Structure for clock speed control
+typedef struct _GPU_CLOCK_SPEEDS {
+    ULONG CoreClockKHz;     // Core clock in KHz
+    ULONG MemoryClockKHz;   // Memory clock in KHz
+    BOOLEAN ApplyOverclock;  // TRUE to apply overclocking
+    ULONG Reserved[3];
+} GPU_CLOCK_SPEEDS, *PGPU_CLOCK_SPEEDS;
+
+// Structure for fan speed control
+typedef struct _GPU_FAN_SPEED {
+    ULONG SpeedPercentage;  // 0-100% speed
+    BOOLEAN AutoControl;    // TRUE for automatic control
+    ULONG Reserved[3];
+} GPU_FAN_SPEED, *PGPU_FAN_SPEED;
+
+// Structure for memory information
+typedef struct _GPU_MEMORY_INFO {
+    ULONG64 TotalMemoryBytes;
+    ULONG64 FreeMemoryBytes;
+    ULONG64 UsedMemoryBytes;
+    ULONG NumberOfAllocations;
+    ULONG64 LargestFreeBlockBytes;
+    ULONG FragmentationPercentage;
+    ULONG Reserved[8];
+} GPU_MEMORY_INFO, *PGPU_MEMORY_INFO;
+
+// Define device extension structure for our GPU driver
+typedef struct _DEVICE_EXTENSION {
+    // Basic device data
+    PDEVICE_OBJECT DeviceObject;
+    PDEVICE_OBJECT PhysicalDeviceObject;  // PDO for the GPU device
+    PDEVICE_OBJECT NextLowerDriver;       // Lower driver in the stack
+    UNICODE_STRING DeviceName;
+    UNICODE_STRING SymbolicLinkName;
+    
+    // PCI configuration
+    ULONG BusNumber;
+    ULONG DeviceNumber;
+    ULONG FunctionNumber;
+    BUS_INTERFACE_STANDARD BusInterface;
+    BOOLEAN IsBusInterfaceAcquired;
+    
+    // Device identification
+    USHORT VendorId;
+    USHORT DeviceId;
+    UCHAR RevisionId;
+    USHORT SubsystemVendorId;
+    USHORT SubsystemId;
+    
+    // GPU specific data
+    BOOLEAN GpuInitialized;
+    BOOLEAN GpuPoweredOn;
+    volatile ULONG GpuStatusFlags;
+    GPU_POWER_STATE PowerState;
+    GPU_INFO GpuInfo;
+    LARGE_INTEGER DriverStartTime;  // When the driver was started
+    BOOLEAN AllowUserModeMapping;   // If TRUE, allow user mode mappings
+    BOOLEAN OverclockEnabled;       // If TRUE, overclocking is allowed
+    BOOLEAN FanControlEnabled;      // If TRUE, manual fan control is allowed
+    
+    // Memory management
+    EX_RUNDOWN_REF MemoryRundown;  // Rundown protection
+    LIST_ENTRY MemoryBlockList;
+    KSPIN_LOCK MemoryLock;
+    ULONG64 TotalAllocatedMemory;
+    ULONG64 PeakAllocatedMemory;
+    ULONG MemoryBlockCount;
+    ULONG64 NextMemoryHandle;
+    
+    // Command queue management
+    EX_RUNDOWN_REF CommandRundown;  // Rundown protection
+    LIST_ENTRY CommandQueue;
+    LIST_ENTRY ActiveCommands;
+    LIST_ENTRY CompletedCommands;
+    KSPIN_LOCK CommandLock;
+    KEVENT CommandEvent;
+    PKTHREAD CommandProcessorThread;
+    volatile BOOLEAN CommandProcessorRunning;
+    ULONG64 NextCommandId;
+    ULONG64 CommandsSubmitted;
+    ULONG64 CommandsCompleted;
+    ULONG64 CommandsErrored;
+    
+    // MMIO regions
+    PVOID RegisterBaseVA;         // Virtual address of mapped registers
+    PHYSICAL_ADDRESS RegisterBasePA; // Physical address of registers
+    ULONG RegisterSize;
+    RTL_BITMAP RegisterAccessMap; // Bitmap of valid register addresses
+    PULONG RegisterAccessMapBuffer; // Buffer for register access bitmap
+    ULONG RegisterAccessMapSize;  // Size of register access map buffer
+    
+    // Frame buffer
+    PVOID FrameBufferVA;          // Virtual address of frame buffer
+    PHYSICAL_ADDRESS FrameBufferPA; // Physical address of frame buffer
+    ULONG FrameBufferSize;
+    
+    // Interrupt handling
+    BOOLEAN InterruptRegistered;
+    ULONG InterruptVector;
+    PKINTERRUPT InterruptObject;
+    KDPC InterruptDpc;
+    KSPIN_LOCK InterruptLock;
+    KEVENT InterruptEvent;
+    volatile LONG InterruptCount;
+    volatile LONG DpcCount;
+    
+    // Statistics and performance monitoring
+    KSPIN_LOCK StatsLock;
+    LARGE_INTEGER LastPerformanceUpdateTime;
+    GPU_PERFORMANCE_DATA PerformanceData;
+    ULONG FrameCount;
+    ULONG FrameRate;
+    
+    // Power management
+    BOOLEAN PowerManagementEnabled;
+    ULONG PowerLimitMilliwatts;    // Current power limit in mW
+    ULONG DefaultPowerLimitMilliwatts; // Default power limit in mW
+    
+    // Thermal management
+    BOOLEAN ThermalThrottling;     // TRUE if thermal throttling is active
+    ULONG TemperatureTarget;       // Target temperature in Celsius
+    ULONG TemperatureLimit;        // Temperature limit in Celsius
+    ULONG FanSpeedPercentage;      // Current fan speed percentage
+    BOOLEAN AutoFanControl;        // TRUE if fan speed is automatic
+    
+    // Work items and timers
+    PIO_WORKITEM CleanupWorkItem;
+    KTIMER WatchdogTimer;        // Watchdog timer
+    KDPC WatchdogDpc;            // Watchdog DPC
+    
+    // Error tracking
+    volatile LONG ErrorCount;
+    NTSTATUS LastErrorStatus;
+    LARGE_INTEGER LastErrorTime;
+    CHAR LastErrorLocation[64];    // Last place an error occurred
+    ULONG ErrorThreshold;          // Number of errors before throttling
+    
+    // Device removal tracking
+    volatile BOOLEAN DeviceRemovalPending;
+    KEVENT RemovalEvent;
+    
+    // Registry configuration
+    HANDLE RegistryKey;
+} DEVICE_EXTENSION, *PDEVICE_EXTENSION;
+
+// Forward declarations
+DRIVER_INITIALIZE DriverEntry;
+DRIVER_UNLOAD DriverUnload;
+DRIVER_ADD_DEVICE GpuAddDevice;
+
+_Dispatch_type_(IRP_MJ_CREATE) DRIVER_DISPATCH GpuCreateClose;
+_Dispatch_type_(IRP_MJ_CLOSE) DRIVER_DISPATCH GpuCreateClose;
+_Dispatch_type_(IRP_MJ_CLEANUP) DRIVER_DISPATCH GpuCleanup;
+_Dispatch_type_(IRP_MJ_DEVICE_CONTROL) DRIVER_DISPATCH GpuDeviceControl;
+_Dispatch_type_(IRP_MJ_READ) DRIVER_DISPATCH GpuRead;
+_Dispatch_type_(IRP_MJ_WRITE) DRIVER_DISPATCH GpuWrite;
+_Dispatch_type_(IRP_MJ_POWER) DRIVER_DISPATCH GpuPower;
+_Dispatch_type_(IRP_MJ_SYSTEM_CONTROL) DRIVER_DISPATCH GpuSystemControl;
+_Dispatch_type_(IRP_MJ_PNP) DRIVER_DISPATCH GpuPnP;
+
+IO_COMPLETION_ROUTINE GpuIoCompletionRoutine;
+
+// Device lifecycle management
+NTSTATUS GpuStartDevice(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
+NTSTATUS GpuStopDevice(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
+NTSTATUS GpuRemoveDevice(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
+
+// Registry and configuration functions
+NTSTATUS ReadRegistryParameters(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS SaveRegistryParameters(IN PDEVICE_EXTENSION DeviceExtension);
+
+// PCI configuration helpers
+NTSTATUS ReadPciConfig(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG Offset, OUT PVOID Buffer, IN ULONG Length);
+NTSTATUS WritePciConfig(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG Offset, IN PVOID Buffer, IN ULONG Length);
+NTSTATUS GetPciResources(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS EnablePciDevice(IN PDEVICE_EXTENSION DeviceExtension);
+
+// GPU specific functions
+NTSTATUS InitializeGpu(IN PDEVICE_EXTENSION DeviceExtension);
+VOID CleanupGpu(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS DetectGpuCapabilities(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS UpdateGpuInfo(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS SetGpuPowerState(IN PDEVICE_EXTENSION DeviceExtension, IN GPU_POWER_STATE PowerState);
+NTSTATUS ResetGpu(IN PDEVICE_EXTENSION DeviceExtension, IN BOOLEAN HardReset);
+
+// NVIDIA GTX 1070 specific functions
+NTSTATUS InitializeGTX1070Hardware(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS ConfigureGTX1070Clocks(IN PDEVICE_EXTENSION DeviceExtension, IN BOOLEAN Overclocked);
+NTSTATUS InitializeGTX1070Memory(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS QueryPCIeLinkStatus(IN PDEVICE_EXTENSION DeviceExtension, OUT PULONG LinkWidth, OUT PULONG LinkSpeed);
+NTSTATUS SetGpuFanSpeed(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG SpeedPercentage);
+NTSTATUS SetGpuPowerLimit(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG PowerLimitMilliwatts);
+NTSTATUS GetGpuTemperature(IN PDEVICE_EXTENSION DeviceExtension, OUT PULONG TemperatureCentigrade);
+NTSTATUS GetGpuMemoryInfo(IN PDEVICE_EXTENSION DeviceExtension, OUT PGPU_MEMORY_INFO MemoryInfo);
+
+// Memory management
+NTSTATUS InitializeMemoryManager(IN PDEVICE_EXTENSION DeviceExtension);
+VOID CleanupMemoryManager(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS AllocateGpuMemory(IN PDEVICE_EXTENSION DeviceExtension, IN PGPU_ALLOCATE_REQUEST Request, OUT PULONG64 MemoryHandle);
+NTSTATUS FreeGpuMemory(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG64 MemoryHandle);
+PGPU_MEMORY_BLOCK FindMemoryBlock(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG64 MemoryHandle);
+NTSTATUS MapGpuMemoryToUser(IN PDEVICE_EXTENSION DeviceExtension, IN PGPU_MAP_MEMORY_REQUEST Request);
+NTSTATUS UnmapGpuMemory(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG64 MemoryHandle);
+NTSTATUS CreateVideoMemoryMappingTable(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS MapAddressToGpu(IN PDEVICE_EXTENSION DeviceExtension, IN PHYSICAL_ADDRESS PhysicalAddress, IN ULONG Size, OUT PULONG64 GpuAddress);
+VOID ReferenceMemoryBlock(IN PGPU_MEMORY_BLOCK MemoryBlock);
+VOID DereferenceMemoryBlock(IN PGPU_MEMORY_BLOCK MemoryBlock);
+NTSTATUS MapMemoryToAperture(IN PDEVICE_EXTENSION DeviceExtension, IN PGPU_MEMORY_BLOCK MemoryBlock);
+VOID UnmapMemoryFromAperture(IN PDEVICE_EXTENSION DeviceExtension, IN PGPU_MEMORY_BLOCK MemoryBlock);
+
+// MMIO and register access
+NTSTATUS MapGpuRegisters(IN PDEVICE_EXTENSION DeviceExtension);
+VOID UnmapGpuRegisters(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS InitializeRegisterAccessMap(IN PDEVICE_EXTENSION DeviceExtension);
+BOOLEAN IsValidRegisterOffset(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG RegisterOffset);
+ULONG ReadGpuRegister(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG RegisterOffset);
+VOID WriteGpuRegister(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG RegisterOffset, IN ULONG Value);
+NTSTATUS ReadGpuMemory(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG64 GpuAddress, IN PVOID Buffer, IN ULONG Size);
+NTSTATUS WriteGpuMemory(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG64 GpuAddress, IN PVOID Buffer, IN ULONG Size);
+
+// Command processing
+NTSTATUS InitializeCommandProcessor(IN PDEVICE_EXTENSION DeviceExtension);
+VOID CleanupCommandProcessor(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS ExecuteGpuCommand(IN PDEVICE_EXTENSION DeviceExtension, IN PGPU_EXECUTE_COMMAND Command, OUT PULONG64 CommandId);
+NTSTATUS WaitForCommandCompletion(IN PDEVICE_EXTENSION DeviceExtension, IN PGPU_WAIT_COMMAND_REQUEST WaitRequest);
+NTSTATUS SubmitCommand(IN PDEVICE_EXTENSION DeviceExtension, IN PGPU_COMMAND_BUFFER CommandBuffer);
+VOID ProcessCommandQueue(IN PDEVICE_EXTENSION DeviceExtension);
+VOID ProcessCommands(IN PDEVICE_EXTENSION DeviceExtension);
+KSTART_ROUTINE CommandProcessorThreadRoutine;
+NTSTATUS Process3DRenderCommand(IN PDEVICE_EXTENSION DeviceExtension, IN PVOID CommandData, IN ULONG CommandSize);
+NTSTATUS ProcessComputeCommand(IN PDEVICE_EXTENSION DeviceExtension, IN PVOID CommandData, IN ULONG CommandSize);
+NTSTATUS ProcessBlitCommand(IN PDEVICE_EXTENSION DeviceExtension, IN PVOID CommandData, IN ULONG CommandSize);
+NTSTATUS ProcessVideoEncodeCommand(IN PDEVICE_EXTENSION DeviceExtension, IN PVOID CommandData, IN ULONG CommandSize);
+NTSTATUS ProcessVideoDecodeCommand(IN PDEVICE_EXTENSION DeviceExtension, IN PVOID CommandData, IN ULONG CommandSize);
+PGPU_COMMAND_BUFFER FindCommand(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG64 CommandId);
+VOID ReferenceCommandBuffer(IN PGPU_COMMAND_BUFFER CommandBuffer);
+VOID DereferenceCommandBuffer(IN PGPU_COMMAND_BUFFER CommandBuffer);
+NTSTATUS CompleteCommand(IN PGPU_COMMAND_BUFFER CommandBuffer, IN NTSTATUS Status);
+
+// Interrupt handling
+NTSTATUS InitializeInterrupts(IN PDEVICE_EXTENSION DeviceExtension);
+VOID CleanupInterrupts(IN PDEVICE_EXTENSION DeviceExtension);
+BOOLEAN GpuInterruptHandler(IN PKINTERRUPT Interrupt, IN PVOID ServiceContext);
+VOID GpuDpcForIsr(IN PKDPC Dpc, IN PVOID DeferredContext, IN PVOID SystemArgument1, IN PVOID SystemArgument2);
+NTSTATUS EnableInterrupts(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS DisableInterrupts(IN PDEVICE_EXTENSION DeviceExtension);
+
+// Performance monitoring
+NTSTATUS UpdatePerformanceData(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS GetPerformanceData(IN PDEVICE_EXTENSION DeviceExtension, OUT PGPU_PERFORMANCE_DATA PerformanceData);
+
+// Watchdog timer
+VOID StartWatchdogTimer(IN PDEVICE_EXTENSION DeviceExtension);
+VOID StopWatchdogTimer(IN PDEVICE_EXTENSION DeviceExtension);
+VOID WatchdogDpcRoutine(IN PKDPC Dpc, IN PVOID DeferredContext, IN PVOID SystemArgument1, IN PVOID SystemArgument2);
+
+// Cleanup routines
+VOID CleanupResources(IN PDEVICE_EXTENSION DeviceExtension);
+VOID CleanupWorkItemCallback(IN PDEVICE_OBJECT DeviceObject, IN PVOID Context);
+
+// Error handling
+VOID RecordError(IN PDEVICE_EXTENSION DeviceExtension, IN NTSTATUS Status);
+VOID RecordErrorEx(IN PDEVICE_EXTENSION DeviceExtension, IN NTSTATUS Status, IN PCHAR Location);
+BOOLEAN RecoverFromError(IN PDEVICE_EXTENSION DeviceExtension);
+BOOLEAN IsGpuHung(IN PDEVICE_EXTENSION DeviceExtension);
+NTSTATUS PerformHardwareReset(IN PDEVICE_EXTENSION DeviceExtension);
+
+// Thermal management
+NTSTATUS MonitorTemperature(IN PDEVICE_EXTENSION DeviceExtension);
+VOID AdjustFanSpeed(IN PDEVICE_EXTENSION DeviceExtension, IN ULONG TemperatureCentigrade);
+BOOLEAN IsThermalThrottlingNeeded(IN PDEVICE_EXTENSION DeviceExtension);
+VOID ApplyThermalThrottling(IN PDEVICE_EXTENSION DeviceExtension, IN BOOLEAN Enable);
+
+// Helper routines
+VOID GetCurrentSystemTime(OUT PLARGE_INTEGER CurrentTime);
+ULONG64 GetTimeInMs(IN LARGE_INTEGER Time);
+ULONG64 GetElapsedTimeInMs(IN LARGE_INTEGER StartTime, IN LARGE_INTEGER EndTime);
+ULONG64 GetDriverUptimeMs(IN PDEVICE_EXTENSION DeviceExtension);
+VOID WaitForMilliseconds(IN ULONG Milliseconds);
+VOID StringToUpper(IN OUT PCHAR String);
+VOID StringToLower(IN OUT PCHAR String);
+BOOLEAN IsStringNullOrEmpty(IN PCHAR String);
+
+// Initialization
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(INIT, DriverEntry)
+#pragma alloc_text(INIT, GpuAddDevice)
+#pragma alloc_text(PAGE, DriverUnload)
+#endif
+
+//
+// Driver entry point - First code to run
+//
+NTSTATUS
+DriverEntry(
+    IN PDRIVER_OBJECT DriverObject,
+    IN PUNICODE_STRING RegistryPath
+)
+{
+    NTSTATUS status;
+    
+    // Get the current time as driver start time
+    GetCurrentSystemTime(&g_DriverStartTime);
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Initializing NVIDIA GPU driver...");
+    GPU_LOG(DEBUG_INFO, "Driver version: %s (%s)", DRIVER_VERSION, DRIVER_DATE);
+
+    // Store driver object global config
+    DriverObject->DriverExtension->AddDevice = GpuAddDevice;
+    DriverObject->DriverUnload = DriverUnload;
+    
+    // Set dispatch routines
+    for (ULONG i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++) {
+        DriverObject->MajorFunction[i] = NULL;
+    }
+    
+    // Register dispatch handlers
+    DriverObject->MajorFunction[IRP_MJ_CREATE]         = GpuCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = GpuCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP]        = GpuCleanup;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = GpuDeviceControl;
+    DriverObject->MajorFunction[IRP_MJ_READ]           = GpuRead;
+    DriverObject->MajorFunction[IRP_MJ_WRITE]          = GpuWrite;
+    DriverObject->MajorFunction[IRP_MJ_POWER]          = GpuPower;
+    DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = GpuSystemControl;
+    DriverObject->MajorFunction[IRP_MJ_PNP]            = GpuPnP;
+
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Driver initialization successful");
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// AddDevice routine - Called when PnP discovers a GPU device
+//
+NTSTATUS
+GpuAddDevice(
+    IN PDRIVER_OBJECT DriverObject,
+    IN PDEVICE_OBJECT PhysicalDeviceObject
+)
+{
+    NTSTATUS status;
+    PDEVICE_OBJECT deviceObject = NULL;
+    PDEVICE_EXTENSION deviceExtension = NULL;
+    UNICODE_STRING deviceName;
+    WCHAR deviceNameBuffer[64] = {0};
+    WCHAR symbolicLinkBuffer[64] = {0};
+    
+    GPU_LOG(DEBUG_INFO, "GpuAddDevice called for PDO 0x%p", PhysicalDeviceObject);
+    
+    // Create device name dynamically based on PDO address to ensure uniqueness
+    status = RtlStringCbPrintfW(deviceNameBuffer, sizeof(deviceNameBuffer), 
+                             L"\\Device\\NvidiaGpuDriver_%p", PhysicalDeviceObject);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to create device name (0x%08X)", status);
+        return status;
+    }
+    
+    RtlInitUnicodeString(&deviceName, deviceNameBuffer);
+    
+    // Create the functional device object (FDO)
+    status = IoCreateDevice(
+        DriverObject,
+        sizeof(DEVICE_EXTENSION),
+        &deviceName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &deviceObject
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to create device object (0x%08X)", status);
+        return status;
+    }
+    
+    // Initialize device extension
+    deviceExtension = (PDEVICE_EXTENSION)deviceObject->DeviceExtension;
+    RtlZeroMemory(deviceExtension, sizeof(DEVICE_EXTENSION));
+    
+    // Store basic device info
+    deviceExtension->DeviceObject = deviceObject;
+    deviceExtension->PhysicalDeviceObject = PhysicalDeviceObject;
+    
+    // Allocate and store device name
+    deviceExtension->DeviceName.Buffer = (PWCHAR)ExAllocatePoolWithTag(
+        NonPagedPool,
+        deviceName.Length + sizeof(WCHAR),
+        GPU_POOL_TAG
+    );
+    
+    if (deviceExtension->DeviceName.Buffer == NULL) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to allocate device name buffer");
+        IoDeleteDevice(deviceObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    deviceExtension->DeviceName.Length = deviceName.Length;
+    deviceExtension->DeviceName.MaximumLength = deviceName.Length + sizeof(WCHAR);
+    RtlCopyMemory(deviceExtension->DeviceName.Buffer, deviceName.Buffer, deviceName.Length);
+    deviceExtension->DeviceName.Buffer[deviceName.Length / sizeof(WCHAR)] = L'\0';
+    
+    // Create symbolic link with unique name
+    status = RtlStringCbPrintfW(symbolicLinkBuffer, sizeof(symbolicLinkBuffer), 
+                             L"\\DosDevices\\NvidiaGpu_%p", PhysicalDeviceObject);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to create symbolic link name (0x%08X)", status);
+        ExFreePoolWithTag(deviceExtension->DeviceName.Buffer, GPU_POOL_TAG);
+        IoDeleteDevice(deviceObject);
+        return status;
+    }
+    
+    // Allocate and store symbolic link name
+    deviceExtension->SymbolicLinkName.Buffer = (PWCHAR)ExAllocatePoolWithTag(
+        NonPagedPool,
+        wcslen(symbolicLinkBuffer) * sizeof(WCHAR) + sizeof(WCHAR),
+        GPU_POOL_TAG
+    );
+    
+    if (deviceExtension->SymbolicLinkName.Buffer == NULL) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to allocate symbolic link buffer");
+        ExFreePoolWithTag(deviceExtension->DeviceName.Buffer, GPU_POOL_TAG);
+        IoDeleteDevice(deviceObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    deviceExtension->SymbolicLinkName.Length = (USHORT)(wcslen(symbolicLinkBuffer) * sizeof(WCHAR));
+    deviceExtension->SymbolicLinkName.MaximumLength = deviceExtension->SymbolicLinkName.Length + sizeof(WCHAR);
+    RtlCopyMemory(deviceExtension->SymbolicLinkName.Buffer, symbolicLinkBuffer, deviceExtension->SymbolicLinkName.Length);
+    deviceExtension->SymbolicLinkName.Buffer[wcslen(symbolicLinkBuffer)] = L'\0';
+    
+    // Create the symbolic link
+    status = IoCreateSymbolicLink(&deviceExtension->SymbolicLinkName, &deviceExtension->DeviceName);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to create symbolic link (0x%08X)", status);
+        ExFreePoolWithTag(deviceExtension->SymbolicLinkName.Buffer, GPU_POOL_TAG);
+        ExFreePoolWithTag(deviceExtension->DeviceName.Buffer, GPU_POOL_TAG);
+        IoDeleteDevice(deviceObject);
+        return status;
+    }
+    
+    // Initialize rundown protection
+    ExInitializeRundownProtection(&deviceExtension->MemoryRundown);
+    ExInitializeRundownProtection(&deviceExtension->CommandRundown);
+    
+    // Initialize various locks
+    KeInitializeSpinLock(&deviceExtension->MemoryLock);
+    KeInitializeSpinLock(&deviceExtension->CommandLock);
+    KeInitializeSpinLock(&deviceExtension->InterruptLock);
+    KeInitializeSpinLock(&deviceExtension->StatsLock);
+    
+    // Initialize lists
+    InitializeListHead(&deviceExtension->MemoryBlockList);
+    InitializeListHead(&deviceExtension->CommandQueue);
+    InitializeListHead(&deviceExtension->ActiveCommands);
+    InitializeListHead(&deviceExtension->CompletedCommands);
+    
+    // Initialize events
+    KeInitializeEvent(&deviceExtension->CommandEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&deviceExtension->InterruptEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&deviceExtension->RemovalEvent, NotificationEvent, FALSE);
+    
+    // Get current time as driver start time
+    GetCurrentSystemTime(&deviceExtension->DriverStartTime);
+    
+    // Initialize timers
+    KeInitializeTimer(&deviceExtension->WatchdogTimer);
+    KeInitializeDpc(&deviceExtension->WatchdogDpc, WatchdogDpcRoutine, deviceExtension);
+    
+    // Initialize default thermal settings
+    deviceExtension->TemperatureTarget = 80; // Default target 80°C
+    deviceExtension->TemperatureLimit = GPU_MAX_TEMP_THRESHOLD; // 95°C max
+    deviceExtension->AutoFanControl = TRUE; // Auto fan control by default
+    deviceExtension->ErrorThreshold = 10;  // 10 errors before throttling
+    
+    // Attach to device stack
+    deviceExtension->NextLowerDriver = IoAttachDeviceToDeviceStack(
+        deviceObject,
+        PhysicalDeviceObject
+    );
+    
+    if (deviceExtension->NextLowerDriver == NULL) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to attach to device stack");
+        IoDeleteSymbolicLink(&deviceExtension->SymbolicLinkName);
+        ExFreePoolWithTag(deviceExtension->SymbolicLinkName.Buffer, GPU_POOL_TAG);
+        ExFreePoolWithTag(deviceExtension->DeviceName.Buffer, GPU_POOL_TAG);
+        IoDeleteDevice(deviceObject);
+        return STATUS_DEVICE_REMOVED;
+    }
+    
+    // Initialize DPC for ISR
+    KeInitializeDpc(&deviceExtension->InterruptDpc, GpuDpcForIsr, deviceExtension);
+    
+    // Set device flags
+    deviceObject->Flags |= DO_DIRECT_IO | DO_POWER_PAGABLE;
+    deviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Device added successfully");
+    return STATUS_SUCCESS;
+}
+
+//
+// Driver unload routine - Clean up all resources
+//
+VOID
+DriverUnload(
+    IN PDRIVER_OBJECT DriverObject
+)
+{
+    PDEVICE_OBJECT deviceObject;
+    PDEVICE_EXTENSION deviceExtension;
+    
+    GPU_LOG(DEBUG_INFO, "Unloading driver version %s (%s)", DRIVER_VERSION, DRIVER_DATE);
+    
+    // Clean up all device objects created by the driver
+    deviceObject = DriverObject->DeviceObject;
+    
+    while (deviceObject != NULL) {
+        // Get the current device extension
+        deviceExtension = (PDEVICE_EXTENSION)deviceObject->DeviceExtension;
+        
+        // Save the next device object before we delete the current one
+        PDEVICE_OBJECT nextDevice = deviceObject->NextDevice;
+        
+        // Clean up resources
+        if (deviceExtension) {
+            // Stop the GPU
+            if (deviceExtension->GpuInitialized) {
+                SetGpuPowerState(deviceExtension, GpuPowerStateD3);
+                CleanupInterrupts(deviceExtension);
+                CleanupCommandProcessor(deviceExtension);
+                CleanupGpu(deviceExtension);
+            }
+            
+            // Delete symbolic link if created
+            if (deviceExtension->SymbolicLinkName.Buffer) {
+                IoDeleteSymbolicLink(&deviceExtension->SymbolicLinkName);
+                ExFreePoolWithTag(deviceExtension->SymbolicLinkName.Buffer, GPU_POOL_TAG);
+            }
+            
+            // Free device name buffer if allocated
+            if (deviceExtension->DeviceName.Buffer) {
+                ExFreePoolWithTag(deviceExtension->DeviceName.Buffer, GPU_POOL_TAG);
+            }
+            
+            // Free register access map if allocated
+            if (deviceExtension->RegisterAccessMapBuffer) {
+                ExFreePoolWithTag(deviceExtension->RegisterAccessMapBuffer, GPU_POOL_TAG);
+            }
+        }
+        
+        // Delete the device object
+        IoDeleteDevice(deviceObject);
+        
+        // Move to the next device
+        deviceObject = nextDevice;
+    }
+    
+    // Log total operations and errors
+    GPU_LOG(DEBUG_INFO, "Total operations completed: %ld, Total errors: %ld",
+           g_TotalOperationsCompleted, g_TotalErrorCount);
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Driver unloaded successfully");
+}
+
+//
+// Create/Close handler
+//
+NTSTATUS
+GpuCreateClose(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    
+    if (irpStack->MajorFunction == IRP_MJ_CREATE) {
+        GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Device opened");
+        
+        // Check if device is in an error state or removal is pending
+        if (deviceExtension->DeviceRemovalPending) {
+            GPU_LOG_SIMPLE(DEBUG_WARNING, "Device open attempt during removal");
+            Irp->IoStatus.Status = STATUS_DELETE_PENDING;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_DELETE_PENDING;
+        }
+        
+        if (deviceExtension->GpuStatusFlags & GPU_STATUS_ERROR) {
+            GPU_LOG_SIMPLE(DEBUG_WARNING, "Device open attempt in error state");
+            Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_DEVICE_NOT_READY;
+        }
+    } else {
+        GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Device closed");
+    }
+    
+    // Complete the request with success
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Cleanup handler - Called when all handles to the device are closed
+//
+NTSTATUS
+GpuCleanup(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    
+    GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Device cleanup");
+    
+    // Complete the request with success
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Device control (IOCTL) handler
+//
+NTSTATUS
+GpuDeviceControl(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack;
+    ULONG ioControlCode;
+    PVOID inputBuffer = NULL;
+    PVOID outputBuffer = NULL;
+    ULONG inputBufferLength = 0;
+    ULONG outputBufferLength = 0;
+    ULONG_PTR information = 0;
+    
+    // Check if device is being removed
+    if (deviceExtension->DeviceRemovalPending) {
+        status = STATUS_DELETE_PENDING;
+        goto CompleteRequest;
+    }
+    
+    // Get request parameters
+    irpStack = IoGetCurrentIrpStackLocation(Irp);
+    ioControlCode = irpStack->Parameters.DeviceIoControl.IoControlCode;
+    inputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    outputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    inputBufferLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    outputBufferLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
+    
+    // Process the IOCTL request based on control code
+    switch (ioControlCode) {
+        case IOCTL_GPU_GET_DRIVER_VERSION:
+            // Return driver version information (this works even if GPU is not initialized)
+            if (outputBufferLength >= sizeof(GPU_DRIVER_VERSION)) {
+                PGPU_DRIVER_VERSION versionInfo = (PGPU_DRIVER_VERSION)outputBuffer;
+                
+                RtlZeroMemory(versionInfo, sizeof(GPU_DRIVER_VERSION));
+                
+                // Copy version string
+                RtlCopyMemory(versionInfo->Version, DRIVER_VERSION, 
+                            min(sizeof(DRIVER_VERSION), sizeof(versionInfo->Version) - 1));
+                
+                // Copy date string
+                RtlCopyMemory(versionInfo->Date, DRIVER_DATE, 
+                            min(sizeof(DRIVER_DATE), sizeof(versionInfo->Date) - 1));
+                
+                // Copy vendor string
+                RtlCopyMemory(versionInfo->Vendor, DRIVER_VENDOR, 
+                            min(sizeof(DRIVER_VENDOR), sizeof(versionInfo->Vendor) - 1));
+                
+                // Parse version numbers
+                ULONG major = 0, minor = 0, patch = 0;
+                PCHAR version = DRIVER_VERSION;
+                major = (ULONG)atoi(version);
+                
+                PCHAR dot1 = strchr(version, '.');
+                if (dot1) {
+                    minor = (ULONG)atoi(dot1 + 1);
+                    
+                    PCHAR dot2 = strchr(dot1 + 1, '.');
+                    if (dot2) {
+                        patch = (ULONG)atoi(dot2 + 1);
+                    }
+                }
+                
+                versionInfo->MajorVersion = major;
+                versionInfo->MinorVersion = minor;
+                versionInfo->PatchVersion = patch;
+                versionInfo->BuildNumber = 1000; // Example build number
+                
+                information = sizeof(GPU_DRIVER_VERSION);
+                GPU_LOG_SIMPLE(DEBUG_VERBOSE, "IOCTL_GPU_GET_DRIVER_VERSION - Returning version info");
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+            
+        case IOCTL_GPU_GET_INFO:
+            // Check if GPU is initialized
+            if (!(deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Return GPU information
+            if (outputBufferLength >= sizeof(GPU_INFO)) {
+                // Update GPU info before returning it
+                status = UpdateGpuInfo(deviceExtension);
+                if (NT_SUCCESS(status)) {
+                    RtlCopyMemory(outputBuffer, &deviceExtension->GpuInfo, sizeof(GPU_INFO));
+                    information = sizeof(GPU_INFO);
+                    GPU_LOG_SIMPLE(DEBUG_VERBOSE, "IOCTL_GPU_GET_INFO - Returning GPU info");
+                }
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+                GPU_LOG_SIMPLE(DEBUG_WARNING, "IOCTL_GPU_GET_INFO - Buffer too small");
+            }
+            break;
+            
+        case IOCTL_GPU_ALLOCATE_MEMORY:
+            // Check if GPU is initialized
+            if (!(deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Check if memory manager is available
+            if (!ExAcquireRundownProtection(&deviceExtension->MemoryRundown)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Allocate GPU memory
+            if (inputBufferLength >= sizeof(GPU_ALLOCATE_REQUEST) &&
+                outputBufferLength >= sizeof(GPU_ALLOCATE_REQUEST)) {
+                
+                PGPU_ALLOCATE_REQUEST request = (PGPU_ALLOCATE_REQUEST)inputBuffer;
+                ULONG64 memoryHandle = 0;
+                
+                // Validate request parameters
+                if (request->Size == 0 || request->Size > (256 * 1024 * 1024)) {
+                    // Size must be > 0 and <= 256MB
+                    status = STATUS_INVALID_PARAMETER;
+                } else if (request->Type >= GpuMemoryTypeMax) {
+                    // Type must be valid
+                    status = STATUS_INVALID_PARAMETER;
+                } else {
+                    status = AllocateGpuMemory(deviceExtension, request, &memoryHandle);
+                    
+                    if (NT_SUCCESS(status)) {
+                        // Return the handle to user mode
+                        request->ResultHandle = memoryHandle;
+                        information = sizeof(GPU_ALLOCATE_REQUEST);
+                        GPU_LOG(DEBUG_VERBOSE, "Allocated memory, handle 0x%llx, size %u", 
+                                memoryHandle, request->Size);
+                    } else {
+                        GPU_LOG(DEBUG_WARNING, "Failed to allocate memory, size %u, status 0x%08X", 
+                                request->Size, status);
+                    }
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            
+            // Release memory rundown protection
+            ExReleaseRundownProtection(&deviceExtension->MemoryRundown);
+            break;
+            
+        case IOCTL_GPU_FREE_MEMORY:
+            // Check if GPU is initialized
+            if (!(deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Check if memory manager is available
+            if (!ExAcquireRundownProtection(&deviceExtension->MemoryRundown)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Free GPU memory
+            if (inputBufferLength >= sizeof(GPU_FREE_REQUEST)) {
+                PGPU_FREE_REQUEST request = (PGPU_FREE_REQUEST)inputBuffer;
+                
+                status = FreeGpuMemory(deviceExtension, request->Handle);
+                
+                if (NT_SUCCESS(status)) {
+                    GPU_LOG(DEBUG_VERBOSE, "Freed memory, handle 0x%llx", request->Handle);
+                } else {
+                    GPU_LOG(DEBUG_WARNING, "Failed to free memory, handle 0x%llx, status 0x%08X", 
+                            request->Handle, status);
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            
+            // Release memory rundown protection
+            ExReleaseRundownProtection(&deviceExtension->MemoryRundown);
+            break;
+            
+        case IOCTL_GPU_MAP_MEMORY_TO_USER:
+            // Check if GPU is initialized
+            if (!(deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Check if memory manager is available
+            if (!ExAcquireRundownProtection(&deviceExtension->MemoryRundown)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Check if user mode mapping is allowed
+            if (!deviceExtension->AllowUserModeMapping) {
+                status = STATUS_ACCESS_DENIED;
+                GPU_LOG_SIMPLE(DEBUG_WARNING, "User mode mapping is not allowed");
+                ExReleaseRundownProtection(&deviceExtension->MemoryRundown);
+                break;
+            }
+            
+            // Map GPU memory to user space
+            if (inputBufferLength >= sizeof(GPU_MAP_MEMORY_REQUEST) &&
+                outputBufferLength >= sizeof(GPU_MAP_MEMORY_REQUEST)) {
+                
+                PGPU_MAP_MEMORY_REQUEST request = (PGPU_MAP_MEMORY_REQUEST)inputBuffer;
+                
+                status = MapGpuMemoryToUser(deviceExtension, request);
+                
+                if (NT_SUCCESS(status)) {
+                    // Copy the updated request with the mapped address back to user mode
+                    RtlCopyMemory(outputBuffer, request, sizeof(GPU_MAP_MEMORY_REQUEST));
+                    information = sizeof(GPU_MAP_MEMORY_REQUEST);
+                    GPU_LOG(DEBUG_VERBOSE, "Mapped memory handle 0x%llx to user address 0x%p",
+                           request->Handle, request->UserAddress);
+                } else {
+                    GPU_LOG(DEBUG_WARNING, "Failed to map memory to user, handle 0x%llx, status 0x%08X",
+                           request->Handle, status);
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            
+            // Release memory rundown protection
+            ExReleaseRundownProtection(&deviceExtension->MemoryRundown);
+            break;
+            
+        case IOCTL_GPU_UNMAP_MEMORY:
+            // Check if memory manager is available
+            if (!ExAcquireRundownProtection(&deviceExtension->MemoryRundown)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Unmap GPU memory from user space
+            if (inputBufferLength >= sizeof(GPU_FREE_REQUEST)) {
+                PGPU_FREE_REQUEST request = (PGPU_FREE_REQUEST)inputBuffer;
+                
+                status = UnmapGpuMemory(deviceExtension, request->Handle);
+                
+                if (NT_SUCCESS(status)) {
+                    GPU_LOG(DEBUG_VERBOSE, "Unmapped memory, handle 0x%llx", request->Handle);
+                } else {
+                    GPU_LOG(DEBUG_WARNING, "Failed to unmap memory, handle 0x%llx, status 0x%08X", 
+                           request->Handle, status);
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            
+            // Release memory rundown protection
+            ExReleaseRundownProtection(&deviceExtension->MemoryRundown);
+            break;
+            
+        case IOCTL_GPU_EXECUTE_COMMAND:
+            // Check if GPU is initialized
+            if (!(deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Check if command processor is available
+            if (!ExAcquireRundownProtection(&deviceExtension->CommandRundown)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            
+            // Execute GPU command
+            if (inputBufferLength >= FIELD_OFFSET(GPU_EXECUTE_COMMAND, CommandData)) {
+                PGPU_EXECUTE_COMMAND cmd = (PGPU_EXECUTE_COMMAND)inputBuffer;
+                ULONG64 commandId = 0;
+                
+                // Validate command parameters
+                if (cmd->CommandType >= GpuCommandMax) {
+                    status = STATUS_INVALID_PARAMETER;
+                    GPU_LOG(DEBUG_WARNING, "Invalid command type: %d", cmd->CommandType);
+                } else if (cmd->CommandSize > GPU_MAX_COMMAND_SIZE) {
+                    status = STATUS_INVALID_PARAMETER;
+                    GPU_LOG(DEBUG_WARNING, "Command size too large: %u", cmd->CommandSize);
+                } else {
+                    // Calculate expected size based on command buffer size
+                    ULONG expectedSize = FIELD_OFFSET(GPU_EXECUTE_COMMAND, CommandData) + cmd->CommandSize;
+                    
+                    if (inputBufferLength >= expectedSize) {
+                        status = ExecuteGpuCommand(deviceExtension, cmd, &commandId);
+                        
+                        if (NT_SUCCESS(status)) {
+                            // Return the command ID
+                            cmd->CommandId = commandId;
+                            information = sizeof(GPU_EXECUTE_COMMAND);
+                            InterlockedIncrement(&g_TotalOperationsCompleted);
+                            GPU_LOG(DEBUG_VERBOSE, "Submitted command ID 0x%llx, type %d", 
+                                  commandId, cmd->CommandType);
+                        } else {
+                            GPU_LOG(DEBUG_WARNING, "Failed to execute command, status 0x%08X", status);
+                        }
+                    } else {
+                        status = STATUS_BUFFER_TOO_SMALL;
+                    }
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            
+            // Release command rundown protection
+            ExReleaseRundownProtection(&deviceExtension->CommandRundown);
+            break;
+            
+        case IOCTL_GPU_WAIT_COMMAND:
+            // Wait for command completion
+            if (inputBufferLength >= sizeof(GPU_WAIT_COMMAND_REQUEST) &&
+                outputBufferLength >= sizeof(GPU_WAIT_COMMAND_REQUEST)) {
+                
+                PGPU_WAIT_COMMAND_REQUEST request = (PGPU_WAIT_COMMAND_REQUEST)inputBuffer;
+                
+                status = WaitForCommandCompletion(deviceExtension, request);
+                
+                if (NT_SUCCESS(status)) {
+                    // Copy the updated request with status info back to user mode
+                    RtlCopyMemory(outputBuffer, request, sizeof(GPU_WAIT_COMMAND_REQUEST));
+                    information = sizeof(GPU_WAIT_COMMAND_REQUEST);
+                    GPU_LOG(DEBUG_VERBOSE, "Wait completed for command ID 0x%llx, status %d", 
+                          request->CommandId, request->Status);
+                } else {
+                    GPU_LOG(DEBUG_WARNING, "Wait failed for command ID 0x%llx, status 0x%08X", 
+                          request->CommandId, status);
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            break;
+            
+        case IOCTL_GPU_QUERY_PERFORMANCE:
+            // Query GPU performance data
+            if (outputBufferLength >= sizeof(GPU_PERFORMANCE_DATA)) {
+                GPU_PERFORMANCE_DATA perfData;
+                
+                status = GetPerformanceData(deviceExtension, &perfData);
+                
+                if (NT_SUCCESS(status)) {
+                    RtlCopyMemory(outputBuffer, &perfData, sizeof(GPU_PERFORMANCE_DATA));
+                    information = sizeof(GPU_PERFORMANCE_DATA);
+                    GPU_LOG(DEBUG_VERBOSE, "Returning performance data (util: %d%%)", 
+                           perfData.UtilizationPercentage);
+                } else {
+                    GPU_LOG(DEBUG_WARNING, "Failed to get performance data, status 0x%08X", status);
+                }
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+            
+        case IOCTL_GPU_SET_POWER_STATE:
+            // Set GPU power state
+            if (inputBufferLength >= sizeof(GPU_POWER_STATE)) {
+                GPU_POWER_STATE powerState = *(PGPU_POWER_STATE)inputBuffer;
+                
+                if (powerState < GpuPowerStateMax) {
+                    status = SetGpuPowerState(deviceExtension, powerState);
+                    
+                    if (NT_SUCCESS(status)) {
+                        GPU_LOG(DEBUG_INFO, "Set power state to %d", powerState);
+                    } else {
+                        GPU_LOG(DEBUG_WARNING, "Failed to set power state to %d, status 0x%08X", 
+                              powerState, status);
+                    }
+                } else {
+                    status = STATUS_INVALID_PARAMETER;
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            break;
+            
+        case IOCTL_GPU_SET_CLOCK_SPEEDS:
+            // Set GPU clock speeds
+            if (inputBufferLength >= sizeof(GPU_CLOCK_SPEEDS)) {
+                PGPU_CLOCK_SPEEDS clockSpeeds = (PGPU_CLOCK_SPEEDS)inputBuffer;
+                
+                // Check if overclocking is enabled
+                if (clockSpeeds->ApplyOverclock && !deviceExtension->OverclockEnabled) {
+                    status = STATUS_ACCESS_DENIED;
+                    GPU_LOG_SIMPLE(DEBUG_WARNING, "Overclocking not enabled");
+                } else {
+                    // Apply the clock speeds
+                    status = ConfigureGTX1070Clocks(deviceExtension, clockSpeeds->ApplyOverclock);
+                    
+                    if (NT_SUCCESS(status)) {
+                        GPU_LOG(DEBUG_INFO, "Set core clock to %d KHz, memory clock to %d KHz",
+                               clockSpeeds->CoreClockKHz, clockSpeeds->MemoryClockKHz);
+                    } else {
+                        GPU_LOG(DEBUG_WARNING, "Failed to set clock speeds, status 0x%08X", status);
+                    }
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            break;
+            
+        case IOCTL_GPU_SET_FAN_SPEED:
+            // Set fan speed
+            if (inputBufferLength >= sizeof(GPU_FAN_SPEED)) {
+                PGPU_FAN_SPEED fanSpeed = (PGPU_FAN_SPEED)inputBuffer;
+                
+                // Check if manual fan control is enabled
+                if (!fanSpeed->AutoControl && !deviceExtension->FanControlEnabled) {
+                    status = STATUS_ACCESS_DENIED;
+                    GPU_LOG_SIMPLE(DEBUG_WARNING, "Manual fan control not enabled");
+                } else {
+                    // Validate fan speed
+                    if (fanSpeed->SpeedPercentage > 100) {
+                        status = STATUS_INVALID_PARAMETER;
+                        GPU_LOG(DEBUG_WARNING, "Invalid fan speed: %d%%", fanSpeed->SpeedPercentage);
+                    } else {
+                        // Set auto fan control
+                        deviceExtension->AutoFanControl = fanSpeed->AutoControl;
+                        
+                        if (!fanSpeed->AutoControl) {
+                            // Set manual fan speed
+                            status = SetGpuFanSpeed(deviceExtension, fanSpeed->SpeedPercentage);
+                            
+                            if (NT_SUCCESS(status)) {
+                                GPU_LOG(DEBUG_INFO, "Set fan speed to %d%%", fanSpeed->SpeedPercentage);
+                            } else {
+                                GPU_LOG(DEBUG_WARNING, "Failed to set fan speed, status 0x%08X", status);
+                            }
+                        } else {
+                            // Auto fan control
+                            ULONG temp;
+                            status = GetGpuTemperature(deviceExtension, &temp);
+                            if (NT_SUCCESS(status)) {
+                                AdjustFanSpeed(deviceExtension, temp);
+                                GPU_LOG(DEBUG_INFO, "Enabled auto fan control, current temp %d°C", temp);
+                            }
+                        }
+                    }
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+            break;
+            
+        case IOCTL_GPU_GET_MEMORY_INFO:
+            // Get memory info
+            if (outputBufferLength >= sizeof(GPU_MEMORY_INFO)) {
+                GPU_MEMORY_INFO memInfo;
+                
+                status = GetGpuMemoryInfo(deviceExtension, &memInfo);
+                
+                if (NT_SUCCESS(status)) {
+                    RtlCopyMemory(outputBuffer, &memInfo, sizeof(GPU_MEMORY_INFO));
+                    information = sizeof(GPU_MEMORY_INFO);
+                    GPU_LOG(DEBUG_VERBOSE, "Returning memory info (used: %llu bytes)", memInfo.UsedMemoryBytes);
+                } else {
+                    GPU_LOG(DEBUG_WARNING, "Failed to get memory info, status 0x%08X", status);
+                }
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+            
+        default:
+            status = STATUS_INVALID_DEVICE_REQUEST;
+            GPU_LOG(DEBUG_WARNING, "Unknown IOCTL code: 0x%08X", ioControlCode);
+            break;
+    }
+    
+CompleteRequest:
+    // Complete the IRP
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = information;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    // Update error count if operation failed
+    if (!NT_SUCCESS(status)) {
+        InterlockedIncrement(&g_TotalErrorCount);
+    }
+    
+    return status;
+}
+
+//
+// Device read handler
+//
+NTSTATUS
+GpuRead(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    LARGE_INTEGER offset = irpStack->Parameters.Read.ByteOffset;
+    ULONG length = irpStack->Parameters.Read.Length;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG_PTR bytesRead = 0;
+    
+    // Check if device is initialized and not being removed
+    if (!(deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED) || deviceExtension->DeviceRemovalPending) {
+        status = deviceExtension->DeviceRemovalPending ? STATUS_DELETE_PENDING : STATUS_DEVICE_NOT_READY;
+        goto CompleteRequest;
+    }
+    
+    // Validate parameters - registers must be read in ULONG blocks
+    if (offset.QuadPart % sizeof(ULONG) != 0) {
+        GPU_LOG(DEBUG_WARNING, "Misaligned register read at offset 0x%llx", offset.QuadPart);
+        status = STATUS_INVALID_PARAMETER;
+        goto CompleteRequest;
+    }
+    
+    // Check if the read request is for GPU registers
+    if (deviceExtension->RegisterBaseVA && offset.QuadPart < deviceExtension->RegisterSize) {
+        // Adjust length if it would go past the end of registers
+        if (offset.QuadPart + length > deviceExtension->RegisterSize) {
+            length = (ULONG)(deviceExtension->RegisterSize - offset.QuadPart);
+        }
+        
+        // Get the MDL for direct I/O
+        PMDL mdl = Irp->MdlAddress;
+        if (!mdl) {
+            status = STATUS_INVALID_PARAMETER;
+            goto CompleteRequest;
+        }
+        
+        // Map the MDL to get a system address we can write to
+        PVOID userBuffer = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute);
+        if (!userBuffer) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto CompleteRequest;
+        }
+        
+        // Read the registers into the user buffer
+        // Note: Limited use of SEH here for hardware access - critical section
+        try {
+            for (ULONG i = 0; i < length; i += sizeof(ULONG)) {
+                // Validate register offset before reading
+                if (IsValidRegisterOffset(deviceExtension, (ULONG)(offset.QuadPart + i))) {
+                    ULONG regValue = ReadGpuRegister(deviceExtension, (ULONG)(offset.QuadPart + i));
+                    RtlCopyMemory((PUCHAR)userBuffer + i, &regValue, sizeof(ULONG));
+                    bytesRead += sizeof(ULONG);
+                } else {
+                    // Invalid register access - break out
+                    GPU_LOG(DEBUG_WARNING, "Invalid register read at offset 0x%llx", 
+                           offset.QuadPart + i);
+                    status = STATUS_INVALID_ADDRESS;
+                    break;
+                }
+            }
+        } except(EXCEPTION_EXECUTE_HANDLER) {
+            // This SEH block is necessary for hardware access that might generate exceptions
+            status = GetExceptionCode();
+            GPU_LOG(DEBUG_ERROR, "Exception during register read at offset 0x%llx: 0x%08X", 
+                   offset.QuadPart, status);
+            RecordErrorEx(deviceExtension, status, "GpuRead");
+        }
+        
+        // Update bytes transferred counter
+        if (NT_SUCCESS(status) && bytesRead > 0) {
+            InterlockedAdd64(&g_TotalBytesTransferred, (LONG64)bytesRead);
+        }
+        
+        GPU_LOG(DEBUG_VERBOSE, "Read %lu bytes from GPU registers at offset 0x%llx", 
+               (ULONG)bytesRead, offset.QuadPart);
+    } else {
+        status = STATUS_INVALID_PARAMETER;
+    }
+    
+CompleteRequest:
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = bytesRead;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    return status;
+}
+
+//
+// Device write handler
+//
+NTSTATUS
+GpuWrite(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    LARGE_INTEGER offset = irpStack->Parameters.Write.ByteOffset;
+    ULONG length = irpStack->Parameters.Write.Length;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG_PTR bytesWritten = 0;
+    
+    // Check if device is initialized and not being removed
+    if (!(deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED) || deviceExtension->DeviceRemovalPending) {
+        status = deviceExtension->DeviceRemovalPending ? STATUS_DELETE_PENDING : STATUS_DEVICE_NOT_READY;
+        goto CompleteRequest;
+    }
+    
+    // Validate parameters - registers must be written in ULONG blocks
+    if (offset.QuadPart % sizeof(ULONG) != 0) {
+        GPU_LOG(DEBUG_WARNING, "Misaligned register write at offset 0x%llx", offset.QuadPart);
+        status = STATUS_INVALID_PARAMETER;
+        goto CompleteRequest;
+    }
+    
+    // Check if the write request is for GPU registers
+    if (deviceExtension->RegisterBaseVA && offset.QuadPart < deviceExtension->RegisterSize) {
+        // Adjust length if it would go past the end of registers
+        if (offset.QuadPart + length > deviceExtension->RegisterSize) {
+            length = (ULONG)(deviceExtension->RegisterSize - offset.QuadPart);
+        }
+        
+        // Get the MDL for direct I/O
+        PMDL mdl = Irp->MdlAddress;
+        if (!mdl) {
+            status = STATUS_INVALID_PARAMETER;
+            goto CompleteRequest;
+        }
+        
+        // Map the MDL to get a system address we can read from
+        PVOID userBuffer = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute);
+        if (!userBuffer) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto CompleteRequest;
+        }
+        
+        // Write the user buffer to the registers
+        // Note: Limited use of SEH here for hardware access - critical section
+        try {
+            for (ULONG i = 0; i < length; i += sizeof(ULONG)) {
+                // Validate register offset before writing
+                if (IsValidRegisterOffset(deviceExtension, (ULONG)(offset.QuadPart + i))) {
+                    ULONG value;
+                    RtlCopyMemory(&value, (PUCHAR)userBuffer + i, sizeof(ULONG));
+                    WriteGpuRegister(deviceExtension, (ULONG)(offset.QuadPart + i), value);
+                    bytesWritten += sizeof(ULONG);
+                } else {
+                    // Invalid register access - break out
+                    GPU_LOG(DEBUG_WARNING, "Invalid register write at offset 0x%llx", 
+                           offset.QuadPart + i);
+                    status = STATUS_INVALID_ADDRESS;
+                    break;
+                }
+            }
+        } except(EXCEPTION_EXECUTE_HANDLER) {
+            // This SEH block is necessary for hardware access that might generate exceptions
+            status = GetExceptionCode();
+            GPU_LOG(DEBUG_ERROR, "Exception during register write at offset 0x%llx: 0x%08X", 
+                   offset.QuadPart, status);
+            RecordErrorEx(deviceExtension, status, "GpuWrite");
+        }
+        
+        // Update bytes transferred counter
+        if (NT_SUCCESS(status) && bytesWritten > 0) {
+            InterlockedAdd64(&g_TotalBytesTransferred, (LONG64)bytesWritten);
+        }
+        
+        GPU_LOG(DEBUG_VERBOSE, "Wrote %lu bytes to GPU registers at offset 0x%llx", 
+               (ULONG)bytesWritten, offset.QuadPart);
+    } else {
+        status = STATUS_INVALID_PARAMETER;
+    }
+    
+CompleteRequest:
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = bytesWritten;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    
+    return status;
+}
+
+//
+// Power management handler
+//
+NTSTATUS
+GpuPower(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    
+    // Get the power state type and power state
+    POWER_STATE_TYPE powerType = irpStack->Parameters.Power.Type;
+    POWER_STATE powerState = irpStack->Parameters.Power.State;
+    POWER_ACTION powerAction = irpStack->Parameters.Power.ShutdownType;
+    
+    GPU_LOG(DEBUG_INFO, "Power IRP: Type=%d, State=%d, Action=%d", 
+            powerType, powerState.DeviceState, powerAction);
+    
+    // Handle device power state changes
+    if (powerType == DevicePowerState) {
+        switch (powerState.DeviceState) {
+            case PowerDeviceD0: // Full power
+                // Mark that we're transitioning to full power
+                if (deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED) {
+                    SetGpuPowerState(deviceExtension, GpuPowerStateD0);
+                }
+                break;
+                
+            case PowerDeviceD3: // Off
+                // Mark that we're transitioning to low power
+                if (deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED) {
+                    SetGpuPowerState(deviceExtension, GpuPowerStateD3);
+                }
+                break;
+                
+            default:
+                // For other states, just pass down
+                break;
+        }
+    }
+    
+    // Forward the IRP to the next lower driver
+    PoStartNextPowerIrp(Irp);
+    IoSkipCurrentIrpStackLocation(Irp);
+    return PoCallDriver(deviceExtension->NextLowerDriver, Irp);
+}
+
+//
+// System control handler for WMI support
+//
+NTSTATUS
+GpuSystemControl(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+    // Forward the IRP to the next lower driver
+    IoSkipCurrentIrpStackLocation(Irp);
+    return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+}
+
+//
+// Plug and Play handler
+//
+NTSTATUS
+GpuPnP(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    switch (irpStack->MinorFunction) {
+        case IRP_MN_START_DEVICE:
+            // The device is starting
+            GPU_LOG_SIMPLE(DEBUG_INFO, "IRP_MN_START_DEVICE received");
+            
+            // Forward the IRP down and wait for it to complete
+            IoCopyCurrentIrpStackLocationToNext(Irp);
+            
+            // Use SynchronousCompletion event to wait for lower driver completion
+            KEVENT waitEvent;
+            KeInitializeEvent(&waitEvent, NotificationEvent, FALSE);
+            
+            IoSetCompletionRoutine(
+                Irp,
+                GpuIoCompletionRoutine,
+                &waitEvent,
+                TRUE,   // InvokeOnSuccess
+                TRUE,   // InvokeOnError
+                TRUE    // InvokeOnCancel
+            );
+            
+            status = IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+            
+            // Wait for lower drivers to complete
+            if (status == STATUS_PENDING) {
+                KeWaitForSingleObject(&waitEvent, Executive, KernelMode, FALSE, NULL);
+                status = Irp->IoStatus.Status;
+            }
+            
+            // If successful, initialize the device
+            if (NT_SUCCESS(status)) {
+                status = GpuStartDevice(DeviceObject, Irp);
+            }
+            
+            // Complete the IRP here
+            Irp->IoStatus.Status = status;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return status;
+            
+        case IRP_MN_STOP_DEVICE:
+            // The device is being stopped
+            GPU_LOG_SIMPLE(DEBUG_INFO, "IRP_MN_STOP_DEVICE received");
+            
+            // Stop the device
+            status = GpuStopDevice(DeviceObject, Irp);
+            
+            // Pass the IRP down
+            Irp->IoStatus.Status = status;
+            IoSkipCurrentIrpStackLocation(Irp);
+            return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+            
+        case IRP_MN_REMOVE_DEVICE:
+            // The device is being removed
+            GPU_LOG_SIMPLE(DEBUG_INFO, "IRP_MN_REMOVE_DEVICE received");
+            
+            // Mark device as being removed to prevent new I/O
+            deviceExtension->DeviceRemovalPending = TRUE;
+            
+            // Wait for existing operations to complete
+            ExWaitForRundownProtectionRelease(&deviceExtension->MemoryRundown);
+            ExWaitForRundownProtectionRelease(&deviceExtension->CommandRundown);
+            
+            // Remove the device
+            status = GpuRemoveDevice(DeviceObject, Irp);
+            
+            // Pass the IRP down
+            Irp->IoStatus.Status = status;
+            IoSkipCurrentIrpStackLocation(Irp);
+            status = IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+            
+            // Do not access deviceExtension after this point!
+            return status;
+            
+        case IRP_MN_QUERY_STOP_DEVICE:
+        case IRP_MN_QUERY_REMOVE_DEVICE:
+            // We can be stopped or removed at any time
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            IoSkipCurrentIrpStackLocation(Irp);
+            return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+            
+        case IRP_MN_CANCEL_STOP_DEVICE:
+        case IRP_MN_CANCEL_REMOVE_DEVICE:
+            // Reset pending removal flag
+            if (deviceExtension->DeviceRemovalPending) {
+                deviceExtension->DeviceRemovalPending = FALSE;
+            }
+            
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            IoSkipCurrentIrpStackLocation(Irp);
+            return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+            
+        case IRP_MN_SURPRISE_REMOVAL:
+            // The device was unexpectedly removed
+            GPU_LOG_SIMPLE(DEBUG_WARNING, "IRP_MN_SURPRISE_REMOVAL received");
+            
+            // Mark device as being removed
+            deviceExtension->DeviceRemovalPending = TRUE;
+            
+            // Begin rundown of memory and command operations
+            ExRundownCompleted(&deviceExtension->MemoryRundown);
+            ExRundownCompleted(&deviceExtension->CommandRundown);
+            
+            // Clean up hardware resources
+            CleanupGpu(deviceExtension);
+            
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            IoSkipCurrentIrpStackLocation(Irp);
+            return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+            
+        default:
+            // Pass all other PnP IRPs down without modification
+            IoSkipCurrentIrpStackLocation(Irp);
+            return IoCallDriver(deviceExtension->NextLowerDriver, Irp);
+    }
+}
+
+//
+// IRP completion routine for forwarded IRPs
+//
+NTSTATUS
+GpuIoCompletionRoutine(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp,
+    IN PVOID Context
+)
+{
+    // Signal the event to wake up the thread waiting for this IRP to complete
+    KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+//
+// Start device routine
+//
+NTSTATUS
+GpuStartDevice(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    NTSTATUS status = STATUS_SUCCESS;
+    LARGE_INTEGER startTime, currentTime;
+    BOOLEAN timedOut = FALSE;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Starting GPU device");
+    
+    // Mark that we're attempting to initialize
+    deviceExtension->GpuStatusFlags = 0;
+    
+    // Get the start time for timeout calculation
+    GetCurrentSystemTime(&startTime);
+    
+    // Read registry parameters for this device
+    status = ReadRegistryParameters(deviceExtension);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_WARNING, "Failed to read registry parameters, using defaults (0x%08X)", status);
+        // Non-fatal, continue with defaults
+    }
+    
+    // In kernel mode, we use SEH extremely carefully and only for hardware access that might cause exceptions
+    try {
+        // Get the PCI resources
+        status = GetPciResources(deviceExtension);
+        if (!NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_ERROR, "Failed to get PCI resources (0x%08X)", status);
+            goto Cleanup;
+        }
+        
+        // Check for NVIDIA GTX 1070 specifically
+        if (deviceExtension->VendorId != NVIDIA_VENDOR_ID || 
+            (deviceExtension->DeviceId != NVIDIA_GTX1070_DEVICE_ID &&
+             deviceExtension->DeviceId != NVIDIA_GTX1070_DEVICE_ID2 &&
+             deviceExtension->DeviceId != NVIDIA_GTX1070_DEVICE_ID3)) {
+            
+            GPU_LOG(DEBUG_WARNING, "Not an NVIDIA GTX 1070: Vendor=0x%04X, Device=0x%04X", 
+                   deviceExtension->VendorId, deviceExtension->DeviceId);
+            
+            // For this example, we'll continue anyway but mark it as safe mode
+            deviceExtension->GpuStatusFlags |= GPU_STATUS_SAFE_MODE;
+        }
+        
+        // Enable the PCI device
+        status = EnablePciDevice(deviceExtension);
+        if (!NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_ERROR, "Failed to enable PCI device (0x%08X)", status);
+            goto Cleanup;
+        }
+        
+        // Initialize the GPU
+        status = InitializeGpu(deviceExtension);
+        if (!NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_ERROR, "Failed to initialize GPU (0x%08X)", status);
+            goto Cleanup;
+        }
+        
+        // Initialize command processor
+        status = InitializeCommandProcessor(deviceExtension);
+        if (!NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_ERROR, "Failed to initialize command processor (0x%08X)", status);
+            CleanupGpu(deviceExtension);
+            goto Cleanup;
+        }
+        
+        // Initialize interrupts if not in safe mode
+        if (!(deviceExtension->GpuStatusFlags & GPU_STATUS_SAFE_MODE)) {
+            status = InitializeInterrupts(deviceExtension);
+            if (!NT_SUCCESS(status)) {
+                GPU_LOG(DEBUG_WARNING, "Failed to initialize interrupts (0x%08X), continuing in polling mode", status);
+                // Non-fatal - continue without interrupts
+            }
+        }
+        
+        // Get initial GPU info
+        status = UpdateGpuInfo(deviceExtension);
+        if (!NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_ERROR, "Failed to update GPU info (0x%08X)", status);
+            CleanupInterrupts(deviceExtension);
+            CleanupCommandProcessor(deviceExtension);
+            CleanupGpu(deviceExtension);
+            goto Cleanup;
+        }
+        
+        // Start watchdog timer
+        StartWatchdogTimer(deviceExtension);
+        
+        // Set the device to full power state
+        status = SetGpuPowerState(deviceExtension, GpuPowerStateD0);
+        if (!NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_ERROR, "Failed to set power state (0x%08X)", status);
+            StopWatchdogTimer(deviceExtension);
+            CleanupInterrupts(deviceExtension);
+            CleanupCommandProcessor(deviceExtension);
+            CleanupGpu(deviceExtension);
+            goto Cleanup;
+        }
+        
+        // Allow user mode memory mapping now that initialization is complete
+        deviceExtension->AllowUserModeMapping = TRUE;
+        
+        // Mark device as initialized and powered on
+        deviceExtension->GpuStatusFlags |= (GPU_STATUS_INITIALIZED | GPU_STATUS_POWERED_ON);
+        
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        // This catches hardware-related exceptions during initialization
+        status = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception during device initialization: 0x%08X", status);
+        RecordErrorEx(deviceExtension, status, "GpuStartDevice");
+        
+        // Clean up any partially initialized resources
+        CleanupResources(deviceExtension);
+        goto Cleanup;
+    }
+    
+    // Check for timeout
+    GetCurrentSystemTime(&currentTime);
+    if (GetElapsedTimeInMs(startTime, currentTime) > GPU_INIT_TIMEOUT_MS) {
+        GPU_LOG(DEBUG_WARNING, "Device initialization took longer than expected (%lld ms)",
+               GetElapsedTimeInMs(startTime, currentTime));
+    }
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Device started successfully");
+    return STATUS_SUCCESS;
+    
+Cleanup:
+    RecordErrorEx(deviceExtension, status, "GpuStartDevice");
+    deviceExtension->GpuStatusFlags |= GPU_STATUS_ERROR;
+    return status;
+}
+
+//
+// Stop device routine
+//
+NTSTATUS
+GpuStopDevice(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Stopping GPU device");
+    
+    // Prevent new memory operations
+    ExWaitForRundownProtectionRelease(&deviceExtension->MemoryRundown);
+    
+    // Prevent new command operations
+    ExWaitForRundownProtectionRelease(&deviceExtension->CommandRundown);
+    
+    // Stop watchdog timer
+    StopWatchdogTimer(deviceExtension);
+    
+    // Clean up in reverse order of initialization
+    if (deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED) {
+        // Power down the GPU
+        SetGpuPowerState(deviceExtension, GpuPowerStateD3);
+        
+        CleanupInterrupts(deviceExtension);
+        CleanupCommandProcessor(deviceExtension);
+        CleanupGpu(deviceExtension);
+        
+        // Clear initialization and power flags
+        deviceExtension->GpuStatusFlags &= ~(GPU_STATUS_INITIALIZED | GPU_STATUS_POWERED_ON);
+    }
+    
+    // Disallow user mode mapping
+    deviceExtension->AllowUserModeMapping = FALSE;
+    
+    // Save statistics to registry before stopping
+    SaveRegistryParameters(deviceExtension);
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Device stopped successfully");
+    return STATUS_SUCCESS;
+}
+
+//
+// Remove device routine
+//
+NTSTATUS
+GpuRemoveDevice(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PDEVICE_OBJECT nextLowerDriver = deviceExtension->NextLowerDriver;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Removing GPU device");
+    
+    // Make sure the device is stopped
+    if (deviceExtension->GpuStatusFlags & GPU_STATUS_INITIALIZED) {
+        CleanupInterrupts(deviceExtension);
+        CleanupCommandProcessor(deviceExtension);
+        CleanupGpu(deviceExtension);
+    }
+    
+    // Close registry handle if open
+    if (deviceExtension->RegistryKey) {
+        ZwClose(deviceExtension->RegistryKey);
+        deviceExtension->RegistryKey = NULL;
+    }
+    
+    // Delete the symbolic link
+    if (deviceExtension->SymbolicLinkName.Buffer) {
+        IoDeleteSymbolicLink(&deviceExtension->SymbolicLinkName);
+    }
+    
+    // Detach from the device stack
+    if (deviceExtension->NextLowerDriver) {
+        IoDetachDevice(deviceExtension->NextLowerDriver);
+    }
+    
+    // Signal that removal is complete
+    KeSetEvent(&deviceExtension->RemovalEvent, IO_NO_INCREMENT, FALSE);
+    
+    // Free symbolic link name buffer if it was dynamically allocated
+    if (deviceExtension->SymbolicLinkName.Buffer) {
+        ExFreePoolWithTag(deviceExtension->SymbolicLinkName.Buffer, GPU_POOL_TAG);
+        deviceExtension->SymbolicLinkName.Buffer = NULL;
+    }
+    
+    // Free device name buffer if it was dynamically allocated
+    if (deviceExtension->DeviceName.Buffer) {
+        ExFreePoolWithTag(deviceExtension->DeviceName.Buffer, GPU_POOL_TAG);
+        deviceExtension->DeviceName.Buffer = NULL;
+    }
+    
+    // Delete any register access map buffer
+    if (deviceExtension->RegisterAccessMapBuffer) {
+        ExFreePoolWithTag(deviceExtension->RegisterAccessMapBuffer, GPU_POOL_TAG);
+        deviceExtension->RegisterAccessMapBuffer = NULL;
+    }
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Device removal complete, deleting device object");
+    
+    // Delete the FDO
+    IoDeleteDevice(DeviceObject);
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Read registry parameters specific to this device
+//
+NTSTATUS
+ReadRegistryParameters(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status;
+    HANDLE regKey;
+    UNICODE_STRING valueName;
+    KEY_VALUE_PARTIAL_INFORMATION keyInfo;
+    ULONG resultLength;
+    UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    
+    // Open driver's service key
+    status = IoOpenDeviceRegistryKey(DeviceExtension->PhysicalDeviceObject, 
+                                   PLUGPLAY_REGKEY_DRIVER, 
+                                   KEY_READ, 
+                                   &regKey);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_WARNING, "Failed to open device registry key (0x%08X)", status);
+        return status;
+    }
+    
+    DeviceExtension->RegistryKey = regKey;
+    
+    // Read debug level
+    RtlInitUnicodeString(&valueName, L"DebugLevel");
+    status = ZwQueryValueKey(
+        regKey,
+        &valueName,
+        KeyValuePartialInformation,
+        buffer,
+        sizeof(buffer),
+        &resultLength
+    );
+    
+    if (NT_SUCCESS(status)) {
+        PKEY_VALUE_PARTIAL_INFORMATION pInfo = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
+        if (pInfo->Type == REG_DWORD && pInfo->DataLength == sizeof(ULONG)) {
+            g_DebugLevel = *(PULONG)pInfo->Data;
+            if (g_DebugLevel > DEBUG_VERBOSE) {
+                g_DebugLevel = DEBUG_VERBOSE;
+            }
+            GPU_LOG(DEBUG_INFO, "DebugLevel set to %d from registry", g_DebugLevel);
+        }
+    }
+    
+    // Read max memory usage
+    RtlInitUnicodeString(&valueName, L"MaxMemoryMB");
+    status = ZwQueryValueKey(
+        regKey,
+        &valueName,
+        KeyValuePartialInformation,
+        buffer,
+        sizeof(buffer),
+        &resultLength
+    );
+    
+    if (NT_SUCCESS(status)) {
+        PKEY_VALUE_PARTIAL_INFORMATION pInfo = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
+        if (pInfo->Type == REG_DWORD && pInfo->DataLength == sizeof(ULONG)) {
+            g_MaxMemoryMB = *(PULONG)pInfo->Data;
+            if (g_MaxMemoryMB < 64) {
+                g_MaxMemoryMB = 64; // Minimum 64MB
+            } else if (g_MaxMemoryMB > 8192) {
+                g_MaxMemoryMB = 8192; // Maximum 8GB
+            }
+            GPU_LOG(DEBUG_INFO, "MaxMemoryMB set to %d from registry", g_MaxMemoryMB);
+        }
+    }
+    
+    // Read overclocking enabled
+    RtlInitUnicodeString(&valueName, L"OverclockEnabled");
+    status = ZwQueryValueKey(
+        regKey,
+        &valueName,
+        KeyValuePartialInformation,
+        buffer,
+        sizeof(buffer),
+        &resultLength
+    );
+    
+    if (NT_SUCCESS(status)) {
+        PKEY_VALUE_PARTIAL_INFORMATION pInfo = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
+        if (pInfo->Type == REG_DWORD && pInfo->DataLength == sizeof(ULONG)) {
+            DeviceExtension->OverclockEnabled = (*(PULONG)pInfo->Data) != 0;
+            GPU_LOG(DEBUG_INFO, "Overclocking %s", DeviceExtension->OverclockEnabled ? "enabled" : "disabled");
+        }
+    }
+    
+    // Read fan control enabled
+    RtlInitUnicodeString(&valueName, L"FanControlEnabled");
+    status = ZwQueryValueKey(
+        regKey,
+        &valueName,
+        KeyValuePartialInformation,
+        buffer,
+        sizeof(buffer),
+        &resultLength
+    );
+    
+    if (NT_SUCCESS(status)) {
+        PKEY_VALUE_PARTIAL_INFORMATION pInfo = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
+        if (pInfo->Type == REG_DWORD && pInfo->DataLength == sizeof(ULONG)) {
+            DeviceExtension->FanControlEnabled = (*(PULONG)pInfo->Data) != 0;
+            GPU_LOG(DEBUG_INFO, "Fan control %s", DeviceExtension->FanControlEnabled ? "enabled" : "disabled");
+        }
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Save registry parameters for this device
+//
+NTSTATUS
+SaveRegistryParameters(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    UNICODE_STRING valueName;
+    
+    // If we don't have a registry key, open one
+    if (DeviceExtension->RegistryKey == NULL) {
+        status = IoOpenDeviceRegistryKey(DeviceExtension->PhysicalDeviceObject, 
+                                       PLUGPLAY_REGKEY_DRIVER, 
+                                       KEY_WRITE, 
+                                       &DeviceExtension->RegistryKey);
+        if (!NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_WARNING, "Failed to open device registry key for writing (0x%08X)", status);
+            return status;
+        }
+    }
+    
+    // Save peak memory usage
+    RtlInitUnicodeString(&valueName, L"PeakMemoryUsage");
+    status = ZwSetValueKey(
+        DeviceExtension->RegistryKey,
+        &valueName,
+        0,
+        REG_QWORD,
+        &DeviceExtension->PeakAllocatedMemory,
+        sizeof(ULONG64)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_WARNING, "Failed to save peak memory usage (0x%08X)", status);
+    }
+    
+    // Save total operations completed
+    ULONG operations = (ULONG)g_TotalOperationsCompleted;
+    RtlInitUnicodeString(&valueName, L"TotalOperations");
+    status = ZwSetValueKey(
+        DeviceExtension->RegistryKey,
+        &valueName,
+        0,
+        REG_DWORD,
+        &operations,
+        sizeof(ULONG)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_WARNING, "Failed to save total operations (0x%08X)", status);
+    }
+    
+    // Save error count
+    ULONG errors = (ULONG)g_TotalErrorCount;
+    RtlInitUnicodeString(&valueName, L"TotalErrors");
+    status = ZwSetValueKey(
+        DeviceExtension->RegistryKey,
+        &valueName,
+        0,
+        REG_DWORD,
+        &errors,
+        sizeof(ULONG)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_WARNING, "Failed to save error count (0x%08X)", status);
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Read from PCI configuration space
+//
+NTSTATUS
+ReadPciConfig(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN ULONG Offset,
+    OUT PVOID Buffer,
+    IN ULONG Length
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    if (!DeviceExtension->IsBusInterfaceAcquired) {
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+    
+    // Note: Using SEH correctly for hardware access
+    try {
+        ULONG bytesRead = DeviceExtension->BusInterface.GetBusData(
+            DeviceExtension->BusInterface.Context,
+            PCI_WHICHSPACE_CONFIG,
+            Buffer,
+            Offset,
+            Length
+        );
+        
+        if (bytesRead != Length) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception reading PCI config at offset 0x%x: 0x%08X", Offset, status);
+    }
+    
+    return status;
+}
+
+//
+// Write to PCI configuration space
+//
+NTSTATUS
+WritePciConfig(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN ULONG Offset,
+    IN PVOID Buffer,
+    IN ULONG Length
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    if (!DeviceExtension->IsBusInterfaceAcquired) {
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+    
+    // Note: Using SEH correctly for hardware access
+    try {
+        ULONG bytesWritten = DeviceExtension->BusInterface.SetBusData(
+            DeviceExtension->BusInterface.Context,
+            PCI_WHICHSPACE_CONFIG,
+            Buffer,
+            Offset,
+            Length
+        );
+        
+        if (bytesWritten != Length) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception writing PCI config at offset 0x%x: 0x%08X", Offset, status);
+    }
+    
+    return status;
+}
+
+//
+// Get PCI resources for the device
+//
+NTSTATUS
+GetPciResources(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status;
+    ULONG length;
+    GUID busInterfaceGuid = GUID_BUS_INTERFACE_STANDARD;
+    
+    // Get the bus interface for accessing PCI config space
+    status = IoGetDeviceProperty(
+        DeviceExtension->PhysicalDeviceObject,
+        DevicePropertyAddress,
+        sizeof(ULONG) * 3,
+        &DeviceExtension->BusNumber,
+        &length
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to get device address (0x%08X)", status);
+        return status;
+    }
+    
+    GPU_LOG(DEBUG_INFO, "PCI Address: Bus %d, Device %d, Function %d",
+           DeviceExtension->BusNumber, DeviceExtension->DeviceNumber, DeviceExtension->FunctionNumber);
+    
+    // Get the bus interface
+    status = IoGetDeviceInterface(
+        &busInterfaceGuid,
+        DeviceExtension->PhysicalDeviceObject,
+        sizeof(BUS_INTERFACE_STANDARD),
+        &DeviceExtension->BusInterface
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to get bus interface (0x%08X)", status);
+        return status;
+    }
+    
+    DeviceExtension->IsBusInterfaceAcquired = TRUE;
+    
+    // Read vendor and device IDs
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_VENDOR_ID,
+        &DeviceExtension->VendorId,
+        sizeof(USHORT)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to read vendor ID (0x%08X)", status);
+        return status;
+    }
+    
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_DEVICE_ID,
+        &DeviceExtension->DeviceId,
+        sizeof(USHORT)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to read device ID (0x%08X)", status);
+        return status;
+    }
+    
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_REVISION_ID,
+        &DeviceExtension->RevisionId,
+        sizeof(UCHAR)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to read revision ID (0x%08X)", status);
+        return status;
+    }
+    
+    // Read subsystem vendor and device IDs
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_SUBSYS_VENDOR_ID,
+        &DeviceExtension->SubsystemVendorId,
+        sizeof(USHORT)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        // Not critical, continue with default values
+        DeviceExtension->SubsystemVendorId = DeviceExtension->VendorId;
+    }
+    
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_SUBSYS_ID,
+        &DeviceExtension->SubsystemId,
+        sizeof(USHORT)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        // Not critical, continue with default values
+        DeviceExtension->SubsystemId = DeviceExtension->DeviceId;
+    }
+    
+    GPU_LOG(DEBUG_INFO, "Found device - VendorID: 0x%04X, DeviceID: 0x%04X, RevisionID: 0x%02X",
+           DeviceExtension->VendorId, DeviceExtension->DeviceId, DeviceExtension->RevisionId);
+    GPU_LOG(DEBUG_INFO, "Subsystem - VendorID: 0x%04X, DeviceID: 0x%04X",
+           DeviceExtension->SubsystemVendorId, DeviceExtension->SubsystemId);
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Enable the PCI device
+//
+NTSTATUS
+EnablePciDevice(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status;
+    USHORT commandReg;
+    
+    // Read current command register
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_COMMAND,
+        &commandReg,
+        sizeof(USHORT)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to read command register (0x%08X)", status);
+        return status;
+    }
+    
+    // Enable memory space, bus mastering, and error reporting
+    commandReg |= (PCI_COMMAND_MEM_ENABLE | PCI_COMMAND_MASTER_ENABLE | 
+                   PCI_COMMAND_SERR_ENABLE | PCI_COMMAND_PARITY_ENABLE);
+    
+    // Write updated command register
+    status = WritePciConfig(
+        DeviceExtension,
+        PCI_CONFIG_COMMAND,
+        &commandReg,
+        sizeof(USHORT)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to write command register (0x%08X)", status);
+        return status;
+    }
+    
+    // Read interrupt line and pin information
+    UCHAR interruptLine, interruptPin;
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_INTERRUPT_LINE,
+        &interruptLine,
+        sizeof(UCHAR)
+    );
+    
+    if (NT_SUCCESS(status)) {
+        status = ReadPciConfig(
+            DeviceExtension,
+            PCI_CONFIG_INTERRUPT_PIN,
+            &interruptPin,
+            sizeof(UCHAR)
+        );
+        
+        if (NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_INFO, "Interrupt: Line=%d, Pin=%c", 
+                    interruptLine, interruptPin ? ('A' + interruptPin - 1) : 'X');
+        }
+    }
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "PCI device enabled successfully");
+    return STATUS_SUCCESS;
+}
+
+//
+// Initialize the GPU
+//
+NTSTATUS
+InitializeGpu(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status;
+    PHYSICAL_ADDRESS bar0 = {0};
+    ULONG bar0Value = 0;
+    ULONG bar1Value = 0;
+    
+    // Read BAR0 register to get MMIO address
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_BAR0,
+        &bar0Value,
+        sizeof(ULONG)
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to read BAR0 (0x%08X)", status);
+        return status;
+    }
+    
+    // Check if BAR0 is a memory BAR
+    if ((bar0Value & PCI_BAR_TYPE_MASK) != PCI_BAR_TYPE_MEMORY) {
+        GPU_LOG(DEBUG_ERROR, "BAR0 is not a memory BAR (0x%08X)", bar0Value);
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    
+    // Get the physical address from BAR0
+    bar0.LowPart = bar0Value & PCI_BAR_MEM_MASK;
+    bar0.HighPart = 0;
+    
+    // Store the physical address of registers
+    DeviceExtension->RegisterBasePA = bar0;
+    
+    // For NVIDIA GTX 1070, register space is typically 16MB
+    DeviceExtension->RegisterSize = 0x1000000;  // 16MB of registers
+    
+    // Read BAR1 for frame buffer (optional)
+    status = ReadPciConfig(
+        DeviceExtension,
+        PCI_CONFIG_BAR1,
+        &bar1Value,
+        sizeof(ULONG)
+    );
+    
+    if (NT_SUCCESS(status)) {
+        // Check if BAR1 is a memory BAR
+        if ((bar1Value & PCI_BAR_TYPE_MASK) == PCI_BAR_TYPE_MEMORY) {
+            PHYSICAL_ADDRESS bar1;
+            bar1.LowPart = bar1Value & PCI_BAR_MEM_MASK;
+            bar1.HighPart = 0;
+            
+            // Store frame buffer details
+            DeviceExtension->FrameBufferPA = bar1;
+            DeviceExtension->FrameBufferSize = 0x1000000; // Default 16MB
+            
+            GPU_LOG(DEBUG_INFO, "Frame buffer found at 0x%llx", bar1.QuadPart);
+        }
+    }
+    
+    // Map the registers
+    status = MapGpuRegisters(DeviceExtension);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to map GPU registers (0x%08X)", status);
+        return status;
+    }
+    
+    // Initialize register access map
+    status = InitializeRegisterAccessMap(DeviceExtension);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_WARNING, "Failed to initialize register access map (0x%08X)", status);
+        // Non-fatal - continue without register protection
+    }
+    
+    // Initialize the memory manager
+    status = InitializeMemoryManager(DeviceExtension);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to initialize memory manager (0x%08X)", status);
+        UnmapGpuRegisters(DeviceExtension);
+        return status;
+    }
+    
+    // Initialize GTX 1070 specific hardware
+    status = InitializeGTX1070Hardware(DeviceExtension);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to initialize GTX 1070 hardware (0x%08X)", status);
+        CleanupMemoryManager(DeviceExtension);
+        UnmapGpuRegisters(DeviceExtension);
+        return status;
+    }
+    
+    // Detect GPU capabilities
+    status = DetectGpuCapabilities(DeviceExtension);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to detect GPU capabilities (0x%08X)", status);
+        CleanupMemoryManager(DeviceExtension);
+        UnmapGpuRegisters(DeviceExtension);
+        return status;
+    }
+    
+    // Set the device to full power state
+    status = SetGpuPowerState(DeviceExtension, GpuPowerStateD0);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to set power state (0x%08X)", status);
+        CleanupMemoryManager(DeviceExtension);
+        UnmapGpuRegisters(DeviceExtension);
+        return status;
+    }
+    
+    // Create video memory mapping table for GPU access
+    status = CreateVideoMemoryMappingTable(DeviceExtension);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_WARNING, "Failed to create video memory mapping table (0x%08X)", status);
+        // Non-fatal - continue without GPU memory mapping
+    }
+    
+    DeviceExtension->GpuInitialized = TRUE;
+    DeviceExtension->GpuPoweredOn = TRUE;
+    DeviceExtension->PowerState = GpuPowerStateD0;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "GPU initialized successfully");
+    return STATUS_SUCCESS;
+}
+
+//
+// Initialize GTX 1070 Hardware
+//
+NTSTATUS
+InitializeGTX1070Hardware(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG timeoutCounter = 0;
+    ULONG statusReg;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Initializing NVIDIA GTX 1070 hardware");
+    
+    // Reset interrupt status registers - use SEH for hardware access
+    try {
+        // Reset all interrupt status bits
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_PMC_INTR_0, NV_PASCAL_INTR_RESET_VALUE);
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_MC_INTR_0, NV_PASCAL_INTR_RESET_VALUE);
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_PGRAPH_INTR, NV_PASCAL_INTR_RESET_VALUE);
+        
+        // Enable core components
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_PMC_ENABLE, NV_PASCAL_PMC_ENABLE_VALUE);
+        
+        // Configure memory controller
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_MC_INTR_EN_0, 0x0001FFFF); // Enable all interrupts
+        
+        // Configure graphics engine
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_PGRAPH_INTR_EN, 0x0001FFFF); // Enable all interrupts
+        
+        // Wait for hardware to be ready
+        do {
+            statusReg = ReadGpuRegister(DeviceExtension, NV_PASCAL_PGRAPH_STATUS);
+            if (statusReg == 0xFFFFFFFF) {
+                // Read error - hardware might be disconnected
+                GPU_LOG_SIMPLE(DEBUG_ERROR, "Hardware read error during initialization");
+                return STATUS_DEVICE_NOT_CONNECTED;
+            }
+            
+            // Check if initialization is complete (bit 0 = ready)
+            if (statusReg & 0x1) {
+                break;
+            }
+            
+            // Delay for a short period
+            WaitForMilliseconds(1);
+            timeoutCounter++;
+            
+        } while (timeoutCounter < 1000); // 1 second timeout
+        
+        if (timeoutCounter >= 1000) {
+            GPU_LOG_SIMPLE(DEBUG_ERROR, "Timeout waiting for hardware to initialize");
+            return STATUS_IO_TIMEOUT;
+        }
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        // Handle hardware access exceptions
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception during hardware initialization: 0x%08X", exceptionStatus);
+        RecordErrorEx(DeviceExtension, exceptionStatus, "InitializeGTX1070Hardware");
+        return exceptionStatus;
+    }
+    
+    // Initialize GTX 1070 memory subsystem
+    status = InitializeGTX1070Memory(DeviceExtension);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to initialize memory subsystem: 0x%08X", status);
+        return status;
+    }
+    
+    // Set up initial clocks
+    status = ConfigureGTX1070Clocks(DeviceExtension, FALSE); // FALSE = not overclocked
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_ERROR, "Failed to configure clocks: 0x%08X", status);
+        return status;
+    }
+    
+    // Configure initial fan speed (start with auto control)
+    DeviceExtension->AutoFanControl = TRUE;
+    
+    // Get initial temperature and set fan speed accordingly
+    ULONG temperature;
+    status = GetGpuTemperature(DeviceExtension, &temperature);
+    if (NT_SUCCESS(status)) {
+        AdjustFanSpeed(DeviceExtension, temperature);
+    } else {
+        // Default to 40% if we can't read temperature
+        SetGpuFanSpeed(DeviceExtension, 40);
+    }
+    
+    // Verify hardware is responding properly
+    ULONG timeValue = ReadGpuRegister(DeviceExtension, NV_PASCAL_PTIMER_TIME_0);
+    if (timeValue == 0xFFFFFFFF) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Hardware verification failed - timer not responding");
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+    
+    // Set up default power limit
+    DeviceExtension->PowerLimitMilliwatts = 180000; // 180W for GTX 1070
+    DeviceExtension->DefaultPowerLimitMilliwatts = 180000;
+    
+    // Apply power limit
+    status = SetGpuPowerLimit(DeviceExtension, DeviceExtension->PowerLimitMilliwatts);
+    if (!NT_SUCCESS(status)) {
+        GPU_LOG(DEBUG_WARNING, "Failed to set power limit: 0x%08X", status);
+        // Non-fatal
+    }
+    
+    // Check PCI Express link status
+    ULONG linkWidth, linkSpeed;
+    status = QueryPCIeLinkStatus(DeviceExtension, &linkWidth, &linkSpeed);
+    if (NT_SUCCESS(status)) {
+        DeviceExtension->GpuInfo.PCIeLinkWidth = linkWidth;
+        DeviceExtension->GpuInfo.PCIeLinkSpeed = linkSpeed;
+        GPU_LOG(DEBUG_INFO, "PCIe link: Gen%u x%u", linkSpeed, linkWidth);
+    }
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "GTX 1070 hardware initialized successfully");
+    return STATUS_SUCCESS;
+}
+
+//
+// Configure GTX 1070 Clocks
+//
+NTSTATUS
+ConfigureGTX1070Clocks(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN BOOLEAN Overclocked
+)
+{
+    // Default clocks for GTX 1070
+    ULONG baseCoreClock = 1506000; // 1506 MHz
+    ULONG boostCoreClock = 1683000; // 1683 MHz
+    ULONG memoryClock = 8000000;    // 8000 MHz effective
+    
+    // If overclocked mode is requested
+    if (Overclocked) {
+        // Check if overclocking is enabled
+        if (!DeviceExtension->OverclockEnabled) {
+            GPU_LOG_SIMPLE(DEBUG_WARNING, "Attempted to overclock when not enabled");
+            return STATUS_ACCESS_DENIED;
+        }
+        
+        // Apply conservative overclock
+        baseCoreClock = 1550000;   // 1550 MHz
+        boostCoreClock = 1750000;  // 1750 MHz
+        memoryClock = 8200000;     // 8200 MHz
+        
+        GPU_LOG_SIMPLE(DEBUG_WARNING, "Applying overclocked settings - use with caution");
+    }
+    
+    // Using SEH correctly for hardware access
+    try {
+        // Write core clock settings
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_CLOCK_CONTROL, baseCoreClock / 1000); // Write in MHz
+        
+        // Write memory clock settings (actual register would be different in a real driver)
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_CLOCK_CONTROL + 0x100, memoryClock / 1000);
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception setting clock speeds: 0x%08X", exceptionStatus);
+        RecordErrorEx(DeviceExtension, exceptionStatus, "ConfigureGTX1070Clocks");
+        return exceptionStatus;
+    }
+    
+    // Update our information structure
+    DeviceExtension->GpuInfo.CoreClockKHz = baseCoreClock;
+    DeviceExtension->GpuInfo.BoostClockKHz = boostCoreClock;
+    DeviceExtension->GpuInfo.MemoryClockKHz = memoryClock;
+    
+    GPU_LOG(DEBUG_INFO, "GTX 1070 clocks configured: Base=%u KHz, Boost=%u KHz, Memory=%u KHz",
+           baseCoreClock, boostCoreClock, memoryClock);
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Initialize GTX 1070 Memory Subsystem
+//
+NTSTATUS
+InitializeGTX1070Memory(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    // GTX 1070 has 8GB GDDR5 memory
+    ULONG64 totalMemory = (ULONG64)8 * 1024 * 1024 * 1024;
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    // Using SEH for potential hardware access issues
+    try {
+        // Write memory controller initialization
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_FB_MMU_STATUS, 0x1);
+        
+        // Wait for memory controller to be ready
+        ULONG timeoutCounter = 0;
+        ULONG statusReg;
+        
+        do {
+            statusReg = ReadGpuRegister(DeviceExtension, NV_PASCAL_FB_MMU_STATUS);
+            
+            // Check if initialization is complete (bit 0 = ready)
+            if (statusReg & 0x10) {
+                break;
+            }
+            
+            // Delay for a short period
+            WaitForMilliseconds(1);
+            timeoutCounter++;
+            
+        } while (timeoutCounter < 500); // 500ms timeout
+        
+        if (timeoutCounter >= 500) {
+            GPU_LOG_SIMPLE(DEBUG_WARNING, "Timeout waiting for memory controller");
+            // Continue anyway
+        }
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception during memory initialization: 0x%08X", exceptionStatus);
+        RecordErrorEx(DeviceExtension, exceptionStatus, "InitializeGTX1070Memory");
+        return exceptionStatus;
+    }
+    
+    // Set up memory information
+    DeviceExtension->GpuInfo.TotalLocalMemory = totalMemory;
+    DeviceExtension->GpuInfo.AvailableLocalMemory = totalMemory; // Initially all available
+    
+    // Configure memory parameters
+    DeviceExtension->GpuInfo.MemoryBusWidth = 256;  // GTX 1070 has 256-bit memory interface
+    
+    GPU_LOG(DEBUG_INFO, "GTX 1070 memory system initialized: %llu bytes total (%u MB)",
+           totalMemory, (ULONG)(totalMemory / (1024 * 1024)));
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Query PCIe Link Status for GTX 1070
+//
+NTSTATUS
+QueryPCIeLinkStatus(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    OUT PULONG LinkWidth,
+    OUT PULONG LinkSpeed
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG pcieLinkStatus = 0;
+    
+    // Try to read PCIe capability registers
+    // This is a simplified implementation - real driver would read actual PCIe capability registers
+    try {
+        // Read PCIe link status register (offset would be determined after finding PCIe capability)
+        pcieLinkStatus = ReadGpuRegister(DeviceExtension, 0x0F000); // Example register
+        
+        if (pcieLinkStatus == 0xFFFFFFFF) {
+            // Invalid read, use default values
+            *LinkWidth = 16;  // x16
+            *LinkSpeed = 3;   // Gen3
+            return STATUS_SUCCESS;
+        }
+        
+        // Extract link width (bits 0-5) - example implementation
+        *LinkWidth = pcieLinkStatus & 0x3F;
+        if (*LinkWidth == 0) *LinkWidth = 16; // Default to x16 if invalid
+        
+        // Extract link speed (bits 16-19) - example implementation
+        *LinkSpeed = (pcieLinkStatus >> 16) & 0xF;
+        if (*LinkSpeed == 0) *LinkSpeed = 3; // Default to Gen3 if invalid
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        // If hardware access fails, use default values
+        *LinkWidth = 16;  // x16
+        *LinkSpeed = 3;   // Gen3
+        
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_WARNING, "Exception reading PCIe status: 0x%08X, using defaults", exceptionStatus);
+        status = STATUS_SUCCESS; // Not fatal, continue with defaults
+    }
+    
+    GPU_LOG(DEBUG_INFO, "PCIe Link Status: Gen %u x%u", *LinkSpeed, *LinkWidth);
+    return status;
+}
+
+//
+// Set GPU Fan Speed
+//
+NTSTATUS
+SetGpuFanSpeed(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN ULONG SpeedPercentage
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    // Validate input
+    if (SpeedPercentage > 100) {
+        SpeedPercentage = 100;
+    }
+    
+    try {
+        // Write to fan control register
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_FAN_CONTROL, SpeedPercentage);
+        
+        // Update our stored fan speed
+        DeviceExtension->FanSpeedPercentage = SpeedPercentage;
+        DeviceExtension->GpuInfo.FanSpeedPercentage = SpeedPercentage;
+        
+        // Estimate fan RPM based on percentage (simplified calculation)
+        // Assume 3000 RPM at 100%
+        DeviceExtension->GpuInfo.FanSpeedRPM = (SpeedPercentage * 3000) / 100;
+        
+        GPU_LOG(DEBUG_INFO, "Fan speed set to %u%% (%u RPM)", 
+               SpeedPercentage, DeviceExtension->GpuInfo.FanSpeedRPM);
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception setting fan speed: 0x%08X", exceptionStatus);
+        RecordErrorEx(DeviceExtension, exceptionStatus, "SetGpuFanSpeed");
+        return exceptionStatus;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Set GPU Power Limit
+//
+NTSTATUS
+SetGpuPowerLimit(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN ULONG PowerLimitMilliwatts
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    // Validate input - GTX 1070 typical range 120W-180W
+    if (PowerLimitMilliwatts < 120000) {
+        PowerLimitMilliwatts = 120000; // 120W minimum
+    } else if (PowerLimitMilliwatts > 200000) {
+        PowerLimitMilliwatts = 200000; // 200W maximum
+    }
+    
+    try {
+        // Write to power limit register
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_POWER_MANAGEMENT, PowerLimitMilliwatts / 1000); // Write in watts
+        
+        // Update our stored power limit
+        DeviceExtension->PowerLimitMilliwatts = PowerLimitMilliwatts;
+        
+        GPU_LOG(DEBUG_INFO, "Power limit set to %u watts", PowerLimitMilliwatts / 1000);
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception setting power limit: 0x%08X", exceptionStatus);
+        RecordErrorEx(DeviceExtension, exceptionStatus, "SetGpuPowerLimit");
+        return exceptionStatus;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Get GPU Temperature
+//
+NTSTATUS
+GetGpuTemperature(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    OUT PULONG TemperatureCentigrade
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    try {
+        // Read temperature register
+        ULONG tempReg = ReadGpuRegister(DeviceExtension, NV_PASCAL_THERMAL_SENSOR);
+        
+        if (tempReg == 0xFFFFFFFF) {
+            // Invalid read
+            *TemperatureCentigrade = 50; // Default to 50°C
+            return STATUS_DEVICE_DATA_ERROR;
+        }
+        
+        // Extract temperature value (format depends on hardware)
+        *TemperatureCentigrade = tempReg & 0xFF; // Simplified - assume direct reading
+        
+        // Sanity check - if value seems wrong, use a default
+        if (*TemperatureCentigrade < 20 || *TemperatureCentigrade > 110) {
+            *TemperatureCentigrade = 50; // Default to 50°C
+            return STATUS_DEVICE_DATA_ERROR;
+        }
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        // If hardware access fails, use default value
+        *TemperatureCentigrade = 50; // Default to 50°C
+        
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_WARNING, "Exception reading temperature: 0x%08X", exceptionStatus);
+        return exceptionStatus;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Get Memory Information
+//
+NTSTATUS
+GetGpuMemoryInfo(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    OUT PGPU_MEMORY_INFO MemoryInfo
+)
+{
+    // Validate parameters
+    if (MemoryInfo == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    // Initialize the memory info structure
+    RtlZeroMemory(MemoryInfo, sizeof(GPU_MEMORY_INFO));
+    
+    // Acquire the memory lock to ensure consistency
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&DeviceExtension->MemoryLock, &oldIrql);
+    
+    // Fill in memory information
+    MemoryInfo->TotalMemoryBytes = DeviceExtension->GpuInfo.TotalLocalMemory;
+    MemoryInfo->UsedMemoryBytes = DeviceExtension->TotalAllocatedMemory;
+    MemoryInfo->FreeMemoryBytes = DeviceExtension->GpuInfo.TotalLocalMemory - DeviceExtension->TotalAllocatedMemory;
+    MemoryInfo->NumberOfAllocations = DeviceExtension->MemoryBlockCount;
+    
+    // Calculate fragmentation (simplified)
+    if (DeviceExtension->TotalAllocatedMemory > 0) {
+        MemoryInfo->FragmentationPercentage = (ULONG)(
+            (DeviceExtension->MemoryBlockCount * sizeof(GPU_MEMORY_BLOCK) * 100) /
+            DeviceExtension->TotalAllocatedMemory
+        );
+    } else {
+        MemoryInfo->FragmentationPercentage = 0;
+    }
+    
+    // Find largest free block (simplified)
+    MemoryInfo->LargestFreeBlockBytes = MemoryInfo->FreeMemoryBytes;
+    
+    KeReleaseSpinLock(&DeviceExtension->MemoryLock, oldIrql);
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Create Video Memory Mapping Table
+//
+NTSTATUS
+CreateVideoMemoryMappingTable(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    // This function would set up the page tables used by the GPU to access system memory
+    // For NVIDIA GPUs, this involves setting up the memory management unit (MMU)
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Creating video memory mapping table");
+    
+    try {
+        // Initialize MMU - simplified implementation
+        WriteGpuRegister(DeviceExtension, 0x100000, 0x1); // Example MMU initialization
+        
+        // Allocate page directory (in a real driver, this would be a real memory allocation)
+        // For this implementation, we'll just simulate success
+        
+        // Wait for MMU to initialize
+        ULONG statusReg;
+        ULONG timeout = 0;
+        do {
+            statusReg = ReadGpuRegister(DeviceExtension, 0x100004); // Example status register
+            if (statusReg & 0x1)
+                break;
+                
+            WaitForMilliseconds(1);
+            timeout++;
+        } while (timeout < 100);
+        
+        if (timeout >= 100) {
+            GPU_LOG_SIMPLE(DEBUG_WARNING, "MMU initialization timeout");
+            return STATUS_IO_TIMEOUT;
+        }
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception initializing MMU: 0x%08X", exceptionStatus);
+        RecordErrorEx(DeviceExtension, exceptionStatus, "CreateVideoMemoryMappingTable");
+        return exceptionStatus;
+    }
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Video memory mapping table created successfully");
+    return STATUS_SUCCESS;
+}
+
+//
+// Map Address To GPU
+//
+NTSTATUS
+MapAddressToGpu(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN PHYSICAL_ADDRESS PhysicalAddress,
+    IN ULONG Size,
+    OUT PULONG64 GpuAddress
+)
+{
+    // For GTX 1070, we'll simulate a simple mapping where the GPU address is
+    // the physical address with a high bit set to indicate it's a mapped address
+    
+    // Validate input
+    if (GpuAddress == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    // Create a simple mapping - in a real driver this would involve MMU tables
+    *GpuAddress = PhysicalAddress.QuadPart | 0xFFFFF00000000000ULL;
+    
+    GPU_LOG(DEBUG_INFO, "Mapped PA 0x%llx to GPU address 0x%llx", 
+           PhysicalAddress.QuadPart, *GpuAddress);
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Memory Block Reference/Dereference Functions
+//
+
+// Reference a memory block
+VOID
+ReferenceMemoryBlock(
+    IN PGPU_MEMORY_BLOCK MemoryBlock
+)
+{
+    if (MemoryBlock != NULL) {
+        InterlockedIncrement(&MemoryBlock->ReferenceCount);
+    }
+}
+
+// Dereference a memory block
+VOID
+DereferenceMemoryBlock(
+    IN PGPU_MEMORY_BLOCK MemoryBlock
+)
+{
+    LONG refCount;
+    
+    if (MemoryBlock == NULL) {
+        return;
+    }
+    
+    refCount = InterlockedDecrement(&MemoryBlock->ReferenceCount);
+    
+    if (refCount == 0) {
+        // Last reference is gone, free the block
+        PDEVICE_EXTENSION deviceExtension = MemoryBlock->DeviceExtension;
+        
+        // Remove from the memory block list
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&deviceExtension->MemoryLock, &oldIrql);
+        RemoveEntryList(&MemoryBlock->ListEntry);
+        KeReleaseSpinLock(&deviceExtension->MemoryLock, oldIrql);
+        
+        // Free the MDL if it exists
+        if (MemoryBlock->Mdl) {
+            IoFreeMdl(MemoryBlock->Mdl);
+            MemoryBlock->Mdl = NULL;
+        }
+        
+        // Free the memory
+        if (MemoryBlock->KernelVirtualAddress) {
+            MmFreeContiguousMemory(MemoryBlock->KernelVirtualAddress);
+            MemoryBlock->KernelVirtualAddress = NULL;
+        }
+        
+        // Free any mapping info
+        if (MemoryBlock->MappingInfo) {
+            ExFreePoolWithTag(MemoryBlock->MappingInfo, GPU_MEMORY_TAG);
+            MemoryBlock->MappingInfo = NULL;
+        }
+        
+        // Free the memory block structure
+        ExFreePoolWithTag(MemoryBlock, GPU_MEMORY_TAG);
+    }
+}
+
+//
+// Command Buffer Reference/Dereference Functions
+//
+
+// Reference a command buffer
+VOID
+ReferenceCommandBuffer(
+    IN PGPU_COMMAND_BUFFER CommandBuffer
+)
+{
+    if (CommandBuffer != NULL) {
+        InterlockedIncrement(&CommandBuffer->ReferenceCount);
+    }
+}
+
+// Dereference a command buffer
+VOID
+DereferenceCommandBuffer(
+    IN PGPU_COMMAND_BUFFER CommandBuffer
+)
+{
+    LONG refCount;
+    
+    if (CommandBuffer == NULL) {
+        return;
+    }
+    
+    refCount = InterlockedDecrement(&CommandBuffer->ReferenceCount);
+    
+    if (refCount == 0) {
+        // Last reference is gone, free the buffer
+        
+        // Free the command data if it exists
+        if (CommandBuffer->CommandData) {
+            ExFreePoolWithTag(CommandBuffer->CommandData, GPU_COMMAND_TAG);
+            CommandBuffer->CommandData = NULL;
+        }
+        
+        // Remove any reference to memory block
+        if (CommandBuffer->CommandMemory) {
+            DereferenceMemoryBlock(CommandBuffer->CommandMemory);
+            CommandBuffer->CommandMemory = NULL;
+        }
+        
+        // Free private data if any
+        if (CommandBuffer->PrivateData) {
+            ExFreePoolWithTag(CommandBuffer->PrivateData, GPU_COMMAND_TAG);
+            CommandBuffer->PrivateData = NULL;
+        }
+        
+        // Free the command buffer structure
+        ExFreePoolWithTag(CommandBuffer, GPU_COMMAND_TAG);
+    }
+}
+
+//
+// Complete a command
+//
+NTSTATUS
+CompleteCommand(
+    IN PGPU_COMMAND_BUFFER CommandBuffer,
+    IN NTSTATUS Status
+)
+{
+    PDEVICE_EXTENSION deviceExtension;
+    KIRQL oldIrql;
+    
+    if (CommandBuffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    deviceExtension = CommandBuffer->DeviceExtension;
+    
+    // Update command status
+    CommandBuffer->Status = NT_SUCCESS(Status) ? 
+        GpuCommandStatusComplete : GpuCommandStatusError;
+    CommandBuffer->CompletionStatus = Status;
+    
+    // Get current time as completion time
+    GetCurrentSystemTime(&CommandBuffer->CompletionTime);
+    
+    // Move to completed commands list
+    KeAcquireSpinLock(&deviceExtension->CommandLock, &oldIrql);
+    
+    // Remove from active commands list if it's there
+    BOOLEAN wasActive = FALSE;
+    PLIST_ENTRY entry = deviceExtension->ActiveCommands.Flink;
+    while (entry != &deviceExtension->ActiveCommands) {
+        PGPU_COMMAND_BUFFER currentCmd = CONTAINING_RECORD(entry, GPU_COMMAND_BUFFER, ListEntry);
+        if (currentCmd == CommandBuffer) {
+            RemoveEntryList(&CommandBuffer->ListEntry);
+            wasActive = TRUE;
+            break;
+        }
+        entry = entry->Flink;
+    }
+    
+    // Add to completed commands list
+    InsertTailList(&deviceExtension->CompletedCommands, &CommandBuffer->ListEntry);
+    
+    // Update counters
+    if (NT_SUCCESS(Status)) {
+        InterlockedIncrement64(&deviceExtension->CommandsCompleted);
+    } else {
+        InterlockedIncrement64(&deviceExtension->CommandsErrored);
+    }
+    
+    KeReleaseSpinLock(&deviceExtension->CommandLock, oldIrql);
+    
+    // Signal completion event
+    KeSetEvent(&CommandBuffer->CompletionEvent, IO_NO_INCREMENT, FALSE);
+    
+    GPU_LOG(DEBUG_INFO, "Completed command ID 0x%llx with status 0x%08X", 
+           CommandBuffer->CommandId, CommandBuffer->CompletionStatus);
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Wait for a delay in milliseconds
+//
+VOID
+WaitForMilliseconds(
+    IN ULONG Milliseconds
+)
+{
+    LARGE_INTEGER delay;
+    
+    // Convert milliseconds to 100-nanosecond intervals (negative for relative time)
+    delay.QuadPart = -((LONGLONG)Milliseconds * 10000);
+    
+    // Delay execution
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+}
+
+//
+// Thermal management - Monitor temperature
+//
+NTSTATUS
+MonitorTemperature(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status;
+    ULONG temperature;
+    
+    // Read current temperature
+    status = GetGpuTemperature(DeviceExtension, &temperature);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    
+    // Update temperature in GPU info
+    DeviceExtension->GpuInfo.TemperatureCentigrade = temperature;
+    
+    // Check if we need thermal throttling
+    if (temperature >= DeviceExtension->TemperatureLimit) {
+        // Temperature is too high
+        if (!DeviceExtension->ThermalThrottling) {
+            // Start thermal throttling
+            ApplyThermalThrottling(DeviceExtension, TRUE);
+            DeviceExtension->GpuStatusFlags |= GPU_STATUS_OVERHEATING;
+            GPU_LOG(DEBUG_WARNING, "Temperature %u°C exceeds limit, enabling thermal throttling", 
+                   temperature);
+        }
+    } else if (temperature < (DeviceExtension->TemperatureLimit - 5) && 
+               DeviceExtension->ThermalThrottling) {
+        // Temperature has dropped below threshold, disable throttling
+        ApplyThermalThrottling(DeviceExtension, FALSE);
+        DeviceExtension->GpuStatusFlags &= ~GPU_STATUS_OVERHEATING;
+        GPU_LOG(DEBUG_INFO, "Temperature %u°C below limit, disabling thermal throttling", 
+               temperature);
+    }
+    
+    // Adjust fan speed if auto control is enabled
+    if (DeviceExtension->AutoFanControl) {
+        AdjustFanSpeed(DeviceExtension, temperature);
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+//
+// Apply thermal throttling
+//
+VOID
+ApplyThermalThrottling(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN BOOLEAN Enable
+)
+{
+    // Set the thermal throttling flag
+    DeviceExtension->ThermalThrottling = Enable;
+    
+    if (Enable) {
+        // Reduce clocks to minimum levels
+        ULONG reducedCoreClock = 1200000; // 1.2 GHz
+        
+        try {
+            WriteGpuRegister(DeviceExtension, NV_PASCAL_CLOCK_CONTROL, reducedCoreClock / 1000);
+            DeviceExtension->GpuInfo.CoreClockKHz = reducedCoreClock;
+            
+            // Reduce power limit by 30%
+            SetGpuPowerLimit(DeviceExtension, DeviceExtension->DefaultPowerLimitMilliwatts * 7 / 10);
+        } except(EXCEPTION_EXECUTE_HANDLER) {
+            // Ignore exceptions during thermal management
+            GPU_LOG_SIMPLE(DEBUG_ERROR, "Exception during thermal throttling");
+        }
+    } else {
+        // Restore normal clocks and power
+        try {
+            ConfigureGTX1070Clocks(DeviceExtension, FALSE);
+            SetGpuPowerLimit(DeviceExtension, DeviceExtension->DefaultPowerLimitMilliwatts);
+        } except(EXCEPTION_EXECUTE_HANDLER) {
+            // Ignore exceptions during thermal management
+            GPU_LOG_SIMPLE(DEBUG_ERROR, "Exception during thermal throttling disable");
+        }
+    }
+}
+
+//
+// Adjust fan speed based on temperature
+//
+VOID
+AdjustFanSpeed(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN ULONG TemperatureCentigrade
+)
+{
+    ULONG fanSpeed;
+    
+    // Fan curve implementation:
+    // - Below 40°C: 30% speed
+    // - 40-60°C: Linear from 30% to 50%
+    // - 60-75°C: Linear from 50% to 70%
+    // - 75-85°C: Linear from 70% to 90%
+    // - Above 85°C: 100% speed
+    
+    if (TemperatureCentigrade < 40) {
+        fanSpeed = 30;
+    } else if (TemperatureCentigrade < 60) {
+        fanSpeed = 30 + ((TemperatureCentigrade - 40) * 20) / 20; // 30-50%
+    } else if (TemperatureCentigrade < 75) {
+        fanSpeed = 50 + ((TemperatureCentigrade - 60) * 20) / 15; // 50-70%
+    } else if (TemperatureCentigrade < 85) {
+        fanSpeed = 70 + ((TemperatureCentigrade - 75) * 20) / 10; // 70-90%
+    } else {
+        fanSpeed = 100; // Full speed
+    }
+    
+    // Set the fan speed
+    SetGpuFanSpeed(DeviceExtension, fanSpeed);
+}
+
+//
+// Check if GPU is hung
+//
+BOOLEAN
+IsGpuHung(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    // Check if the GPU is responsive by reading a reliable register
+    try {
+        ULONG timeValue = ReadGpuRegister(DeviceExtension, NV_PASCAL_PTIMER_TIME_0);
+        if (timeValue == 0xFFFFFFFF) {
+            return TRUE; // Device not responding
+        }
+        
+        // Additional check - read another register for verification
+        ULONG statusValue = ReadGpuRegister(DeviceExtension, NV_PASCAL_PMC_BOOT_0);
+        if (statusValue == 0xFFFFFFFF) {
+            return TRUE; // Device not responding
+        }
+        
+        // Check for long-running commands that might indicate a hang
+        KIRQL oldIrql;
+        BOOLEAN hasLongRunningCommands = FALSE;
+        
+        KeAcquireSpinLock(&DeviceExtension->CommandLock, &oldIrql);
+        
+        // Check active commands for timeouts
+        LARGE_INTEGER currentTime;
+        GetCurrentSystemTime(&currentTime);
+        
+        PLIST_ENTRY entry = DeviceExtension->ActiveCommands.Flink;
+        while (entry != &DeviceExtension->ActiveCommands) {
+            PGPU_COMMAND_BUFFER cmd = CONTAINING_RECORD(entry, GPU_COMMAND_BUFFER, ListEntry);
+            
+            // Skip to next entry before potentially modifying the list
+            entry = entry->Flink;
+            
+            // Check if command has been running too long
+            ULONG64 runningTime = GetElapsedTimeInMs(cmd->SubmissionTime, currentTime);
+            ULONG timeout = cmd->TimeoutMs > 0 ? cmd->TimeoutMs : GPU_COMMAND_TIMEOUT_MS;
+            
+            if (runningTime > timeout * 2) { // Double the timeout as hang threshold
+                hasLongRunningCommands = TRUE;
+                
+                // Mark the command as timed out
+                cmd->Status = GpuCommandStatusTimeout;
+                cmd->CompletionStatus = STATUS_TIMEOUT;
+                
+                // Move to completed list
+                RemoveEntryList(&cmd->ListEntry);
+                InsertTailList(&DeviceExtension->CompletedCommands, &cmd->ListEntry);
+                
+                // Signal completion
+                KeSetEvent(&cmd->CompletionEvent, IO_NO_INCREMENT, FALSE);
+                
+                GPU_LOG(DEBUG_WARNING, "Command ID 0x%llx timed out after %llu ms",
+                       cmd->CommandId, runningTime);
+            }
+        }
+        
+        KeReleaseSpinLock(&DeviceExtension->CommandLock, oldIrql);
+        
+        if (hasLongRunningCommands) {
+            // Having timed-out commands suggests a possible hang
+            return TRUE;
+        }
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        // Exception during hardware access suggests a hang
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Exception while checking GPU status - probable hang");
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
+//
+// Perform Hardware Reset
+//
+NTSTATUS
+PerformHardwareReset(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    
+    GPU_LOG_SIMPLE(DEBUG_WARNING, "Performing hardware reset");
+    
+    // Cancel all pending commands
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&DeviceExtension->CommandLock, &oldIrql);
+    
+    // Move all active commands to completed list with error status
+    while (!IsListEmpty(&DeviceExtension->ActiveCommands)) {
+        PLIST_ENTRY entry = RemoveHeadList(&DeviceExtension->ActiveCommands);
+        PGPU_COMMAND_BUFFER cmd = CONTAINING_RECORD(entry, GPU_COMMAND_BUFFER, ListEntry);
+        
+        cmd->Status = GpuCommandStatusCancelled;
+        cmd->CompletionStatus = STATUS_CANCELLED;
+        
+        InsertTailList(&DeviceExtension->CompletedCommands, &cmd->ListEntry);
+        
+        // Signal completion
+        KeSetEvent(&cmd->CompletionEvent, IO_NO_INCREMENT, FALSE);
+    }
+    
+    KeReleaseSpinLock(&DeviceExtension->CommandLock, oldIrql);
+    
+    // Using SEH for hardware access during reset
+    try {
+        // Reset the hardware by writing to reset control register
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_PMC_ENABLE, 0); // Disable all engines
+        
+        // Short delay to allow reset to take effect
+        WaitForMilliseconds(100);
+        
+        // Re-enable the hardware
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_PMC_ENABLE, NV_PASCAL_PMC_ENABLE_VALUE);
+        
+        // Reset interrupt status registers
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_PMC_INTR_0, NV_PASCAL_INTR_RESET_VALUE);
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_MC_INTR_0, NV_PASCAL_INTR_RESET_VALUE);
+        WriteGpuRegister(DeviceExtension, NV_PASCAL_PGRAPH_INTR, NV_PASCAL_INTR_RESET_VALUE);
+        
+        // Wait for hardware to initialize
+        ULONG statusReg;
+        ULONG timeout = 0;
+        do {
+            statusReg = ReadGpuRegister(DeviceExtension, NV_PASCAL_PGRAPH_STATUS);
+            if (statusReg & 0x1)
+                break;
+                
+            WaitForMilliseconds(1);
+            timeout++;
+        } while (timeout < 1000); // 1 second timeout
+        
+        if (timeout >= 1000) {
+            GPU_LOG_SIMPLE(DEBUG_ERROR, "Hardware reset failed - timeout waiting for ready state");
+            return STATUS_IO_TIMEOUT;
+        }
+        
+        // Reinitialize clocks
+        status = ConfigureGTX1070Clocks(DeviceExtension, FALSE);
+        if (!NT_SUCCESS(status)) {
+            GPU_LOG(DEBUG_ERROR, "Failed to reconfigure clocks after reset: 0x%08X", status);
+            return status;
+        }
+    } except(EXCEPTION_EXECUTE_HANDLER) {
+        NTSTATUS exceptionStatus = GetExceptionCode();
+        GPU_LOG(DEBUG_ERROR, "Exception during hardware reset: 0x%08X", exceptionStatus);
+        RecordErrorEx(DeviceExtension, exceptionStatus, "PerformHardwareReset");
+        return exceptionStatus;
+    }
+    
+    // Clear error flags if reset was successful
+    DeviceExtension->GpuStatusFlags &= ~(GPU_STATUS_ERROR | GPU_STATUS_HUNG);
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Hardware reset completed successfully");
+    return STATUS_SUCCESS;
+}
+
+//
+// Record error with location information
+//
+VOID
+RecordErrorEx(
+    IN PDEVICE_EXTENSION DeviceExtension,
+    IN NTSTATUS Status,
+    IN PCHAR Location
+)
+{
+    InterlockedIncrement(&DeviceExtension->ErrorCount);
+    DeviceExtension->LastErrorStatus = Status;
+    GetCurrentSystemTime(&DeviceExtension->LastErrorTime);
+    
+    // Store the location where the error occurred
+    if (Location) {
+        RtlStringCbCopyA(DeviceExtension->LastErrorLocation, 
+                        sizeof(DeviceExtension->LastErrorLocation), 
+                        Location);
+    }
+    
+    // Log the error
+    GPU_LOG(DEBUG_ERROR, "GPU error in %s: 0x%08X", 
+           Location ? Location : "unknown", Status);
+    
+    // Set error flag in status
+    InterlockedOr(&DeviceExtension->GpuStatusFlags, GPU_STATUS_ERROR);
+    
+    // Update global error counter
+    InterlockedIncrement(&g_TotalErrorCount);
+}
+
+//
+// Helper Routines - String functions
+//
+VOID
+StringToUpper(
+    IN OUT PCHAR String
+)
+{
+    if (String == NULL)
+        return;
+        
+    while (*String) {
+        if (*String >= 'a' && *String <= 'z')
+            *String = *String - 'a' + 'A';
+        String++;
+    }
+}
+
+VOID
+StringToLower(
+    IN OUT PCHAR String
+)
+{
+    if (String == NULL)
+        return;
+        
+    while (*String) {
+        if (*String >= 'A' && *String <= 'Z')
+            *String = *String - 'A' + 'a';
+        String++;
+    }
+}
+
+BOOLEAN
+IsStringNullOrEmpty(
+    IN PCHAR String
+)
+{
+    return (String == NULL || String[0] == '\0');
+}
+
+//
+// Get driver uptime in milliseconds
+//
+ULONG64
+GetDriverUptimeMs(
+    IN PDEVICE_EXTENSION DeviceExtension
+)
+{
+    LARGE_INTEGER currentTime;
+    GetCurrentSystemTime(&currentTime);
+    return GetElapsedTimeInMs(DeviceExtension->DriverStartTime, currentTime);
+}
+
+// Add the INF file for the driver
+
+    
