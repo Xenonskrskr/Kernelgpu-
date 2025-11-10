@@ -1,2 +1,4 @@
 # Kernelgpu-
-Kernelgpu 
+USE AT YOUR OWN RISK
+LEARNING ONLY
+WANT CREDITS
