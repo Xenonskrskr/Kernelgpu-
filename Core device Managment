@@ -1,0 +1,121 @@
+// GpuStartDevice - Initialize GPU hardware
+NTSTATUS GpuStartDevice(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    
+    // Read PCI configuration
+    if (!NT_SUCCESS(GetPciResources(deviceExtension))) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to get PCI resources");
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    
+    // Enable the PCI device
+    if (!NT_SUCCESS(EnablePciDevice(deviceExtension))) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to enable PCI device");
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    
+    // Map GPU registers to kernel virtual address space
+    if (!NT_SUCCESS(MapGpuRegisters(deviceExtension))) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to map GPU registers");
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    
+    // Initialize memory manager
+    if (!NT_SUCCESS(InitializeMemoryManager(deviceExtension))) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to initialize memory manager");
+        UnmapGpuRegisters(deviceExtension);
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    
+    // Initialize GPU hardware
+    if (!NT_SUCCESS(InitializeGpu(deviceExtension))) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to initialize GPU");
+        CleanupMemoryManager(deviceExtension);
+        UnmapGpuRegisters(deviceExtension);
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    
+    // Initialize command processor
+    if (!NT_SUCCESS(InitializeCommandProcessor(deviceExtension))) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to initialize command processor");
+        CleanupGpu(deviceExtension);
+        CleanupMemoryManager(deviceExtension);
+        UnmapGpuRegisters(deviceExtension);
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    
+    // Initialize interrupt handling
+    if (!NT_SUCCESS(InitializeInterrupts(deviceExtension))) {
+        GPU_LOG_SIMPLE(DEBUG_ERROR, "Failed to initialize interrupts");
+        CleanupCommandProcessor(deviceExtension);
+        CleanupGpu(deviceExtension);
+        CleanupMemoryManager(deviceExtension);
+        UnmapGpuRegisters(deviceExtension);
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    
+    // Start performance monitoring
+    StartWatchdogTimer(deviceExtension);
+    
+    deviceExtension->GpuInitialized = TRUE;
+    GPU_LOG_SIMPLE(DEBUG_INFO, "GPU device started successfully");
+    
+    return STATUS_SUCCESS;
+}
+
+// GpuStopDevice - Disable GPU and clean up
+NTSTATUS GpuStopDevice(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    
+    if (!deviceExtension->GpuInitialized) {
+        return STATUS_SUCCESS;
+    }
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Stopping GPU device");
+    
+    // Stop watchdog timer
+    StopWatchdogTimer(deviceExtension);
+    
+    // Power down GPU
+    SetGpuPowerState(deviceExtension, GpuPowerStateD3);
+    
+    // Clean up all subsystems
+    CleanupInterrupts(deviceExtension);
+    CleanupCommandProcessor(deviceExtension);
+    CleanupGpu(deviceExtension);
+    CleanupMemoryManager(deviceExtension);
+    UnmapGpuRegisters(deviceExtension);
+    
+    deviceExtension->GpuInitialized = FALSE;
+    GPU_LOG_SIMPLE(DEBUG_INFO, "GPU device stopped successfully");
+    
+    return STATUS_SUCCESS;
+}
+
+// GpuRemoveDevice - Final cleanup before device removal
+NTSTATUS GpuRemoveDevice(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "Removing GPU device");
+    
+    // Signal pending removal
+    deviceExtension->DeviceRemovalPending = TRUE;
+    KeSetEvent(&deviceExtension->RemovalEvent, 0, FALSE);
+    
+    // Detach from device stack
+    if (deviceExtension->NextLowerDriver) {
+        IoDetachDevice(deviceExtension->NextLowerDriver);
+    }
+    
+    // Stop the device if still running
+    if (deviceExtension->GpuInitialized) {
+        GpuStopDevice(DeviceObject, Irp);
+    }
+    
+    GPU_LOG_SIMPLE(DEBUG_INFO, "GPU device removed");
+    
+    return STATUS_SUCCESS;
+}
