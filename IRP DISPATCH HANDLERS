@@ -1,10 +1,27 @@
 // Read handler
 NTSTATUS GpuRead(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
-    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    PDEVICE_EXTENSION deviceExtension = NULL;
+    PIO_STACK_LOCATION irpStack = NULL;
+    
+    if (!DeviceObject || !Irp) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    if (!deviceExtension) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    irpStack = IoGetCurrentIrpStackLocation(Irp);
+    if (!irpStack) {
+        return STATUS_INVALID_PARAMETER;
+    }
     
     GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Read request received");
+    
+    // TODO: Implement actual GPU memory read operation
+    // This would read from GPU device memory
     
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
@@ -16,10 +33,27 @@ NTSTATUS GpuRead(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 // Write handler
 NTSTATUS GpuWrite(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
-    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    PDEVICE_EXTENSION deviceExtension = NULL;
+    PIO_STACK_LOCATION irpStack = NULL;
+    
+    if (!DeviceObject || !Irp) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    if (!deviceExtension) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    irpStack = IoGetCurrentIrpStackLocation(Irp);
+    if (!irpStack) {
+        return STATUS_INVALID_PARAMETER;
+    }
     
     GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Write request received");
+    
+    // TODO: Implement actual GPU memory write operation
+    // This would write to GPU device memory
     
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
@@ -31,71 +65,120 @@ NTSTATUS GpuWrite(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 // Device control (IOCTL) handler
 NTSTATUS GpuDeviceControl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
-    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
-    ULONG controlCode = irpStack->Parameters.DeviceIoControl.InputBufferLength;
-    PVOID inputBuffer = Irp->AssociatedIrp.SystemBuffer;
-    PVOID outputBuffer = Irp->AssociatedIrp.SystemBuffer;
-    ULONG inputLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
-    ULONG outputLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
+    PDEVICE_EXTENSION deviceExtension = NULL;
+    PIO_STACK_LOCATION irpStack = NULL;
+    ULONG controlCode = 0;  // ✅ FIXED: Now will read the control code properly
+    PVOID inputBuffer = NULL;
+    PVOID outputBuffer = NULL;
+    ULONG inputLength = 0;
+    ULONG outputLength = 0;
     NTSTATUS status = STATUS_SUCCESS;
     ULONG_PTR information = 0;
+    
+    if (!DeviceObject || !Irp) {
+        status = STATUS_INVALID_PARAMETER;
+        goto cleanup;
+    }
+    
+    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    if (!deviceExtension) {
+        status = STATUS_INVALID_PARAMETER;
+        goto cleanup;
+    }
+    
+    irpStack = IoGetCurrentIrpStackLocation(Irp);
+    if (!irpStack) {
+        status = STATUS_INVALID_PARAMETER;
+        goto cleanup;
+    }
+    
+    // ✅ FIXED: Read the correct field for control code (was reading InputBufferLength)
+    controlCode = irpStack->Parameters.DeviceIoControl.IoControlCode;
+    inputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    outputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    inputLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    outputLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
     
     GPU_LOG(DEBUG_VERBOSE, "Device control request: 0x%08X", controlCode);
     
     if (deviceExtension->DeviceRemovalPending) {
-        Irp->IoStatus.Status = STATUS_DELETE_PENDING;
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_DELETE_PENDING;
+        status = STATUS_DELETE_PENDING;
+        goto cleanup;
     }
     
     switch (controlCode) {
         case IOCTL_GPU_GET_INFO:
-            if (outputLength >= sizeof(GPU_INFO)) {
+            if (!outputBuffer || outputLength < sizeof(GPU_INFO)) {
+                status = STATUS_BUFFER_TOO_SMALL;
+            } else {
                 RtlCopyMemory(outputBuffer, &deviceExtension->GpuInfo, sizeof(GPU_INFO));
                 information = sizeof(GPU_INFO);
                 status = STATUS_SUCCESS;
-            } else {
-                status = STATUS_BUFFER_TOO_SMALL;
+                GPU_LOG_SIMPLE(DEBUG_INFO, "GPU info retrieved successfully");
             }
             break;
             
         case IOCTL_GPU_GET_DRIVER_VERSION:
-            if (outputLength >= sizeof(GPU_DRIVER_VERSION)) {
-                PGPU_DRIVER_VERSION driverVersion = (PGPU_DRIVER_VERSION)outputBuffer;
-                RtlStringCbCopyA((PCHAR)driverVersion->Version, sizeof(driverVersion->Version), DRIVER_VERSION);
-                RtlStringCbCopyA((PCHAR)driverVersion->Date, sizeof(driverVersion->Date), DRIVER_DATE);
-                RtlStringCbCopyA((PCHAR)driverVersion->Vendor, sizeof(driverVersion->Vendor), DRIVER_VENDOR);
-                information = sizeof(GPU_DRIVER_VERSION);
-                status = STATUS_SUCCESS;
-            } else {
+            if (!outputBuffer || outputLength < sizeof(GPU_DRIVER_VERSION)) {
                 status = STATUS_BUFFER_TOO_SMALL;
+            } else {
+                PGPU_DRIVER_VERSION driverVersion = (PGPU_DRIVER_VERSION)outputBuffer;
+                
+                status = RtlStringCbCopyA((PCHAR)driverVersion->Version, 
+                                         sizeof(driverVersion->Version), 
+                                         DRIVER_VERSION);
+                if (!NT_SUCCESS(status)) {
+                    goto cleanup;
+                }
+                
+                status = RtlStringCbCopyA((PCHAR)driverVersion->Date, 
+                                         sizeof(driverVersion->Date), 
+                                         DRIVER_DATE);
+                if (!NT_SUCCESS(status)) {
+                    goto cleanup;
+                }
+                
+                status = RtlStringCbCopyA((PCHAR)driverVersion->Vendor, 
+                                         sizeof(driverVersion->Vendor), 
+                                         DRIVER_VENDOR);
+                if (NT_SUCCESS(status)) {
+                    information = sizeof(GPU_DRIVER_VERSION);
+                    GPU_LOG_SIMPLE(DEBUG_INFO, "Driver version retrieved successfully");
+                }
             }
             break;
             
         case IOCTL_GPU_QUERY_PERFORMANCE:
-            if (outputLength >= sizeof(GPU_PERFORMANCE_DATA)) {
-                status = GetPerformanceData(deviceExtension, (PGPU_PERFORMANCE_DATA)outputBuffer);
-                information = sizeof(GPU_PERFORMANCE_DATA);
-            } else {
+            if (!outputBuffer || outputLength < sizeof(GPU_PERFORMANCE_DATA)) {
                 status = STATUS_BUFFER_TOO_SMALL;
+            } else {
+                status = GetPerformanceData(deviceExtension, (PGPU_PERFORMANCE_DATA)outputBuffer);
+                if (NT_SUCCESS(status)) {
+                    information = sizeof(GPU_PERFORMANCE_DATA);
+                    GPU_LOG_SIMPLE(DEBUG_INFO, "Performance data retrieved successfully");
+                }
             }
             break;
             
         case IOCTL_GPU_GET_MEMORY_INFO:
-            if (outputLength >= sizeof(GPU_MEMORY_INFO)) {
-                status = GetGpuMemoryInfo(deviceExtension, (PGPU_MEMORY_INFO)outputBuffer);
-                information = sizeof(GPU_MEMORY_INFO);
-            } else {
+            if (!outputBuffer || outputLength < sizeof(GPU_MEMORY_INFO)) {
                 status = STATUS_BUFFER_TOO_SMALL;
+            } else {
+                status = GetGpuMemoryInfo(deviceExtension, (PGPU_MEMORY_INFO)outputBuffer);
+                if (NT_SUCCESS(status)) {
+                    information = sizeof(GPU_MEMORY_INFO);
+                    GPU_LOG_SIMPLE(DEBUG_INFO, "Memory info retrieved successfully");
+                }
             }
             break;
             
         default:
+            GPU_LOG(DEBUG_WARNING, "Unknown IOCTL code: 0x%08X", controlCode);
             status = STATUS_NOT_SUPPORTED;
             break;
     }
     
+cleanup:
     Irp->IoStatus.Status = status;
     Irp->IoStatus.Information = information;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -106,6 +189,17 @@ NTSTATUS GpuDeviceControl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 // Cleanup handler
 NTSTATUS GpuCleanup(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
+    PDEVICE_EXTENSION deviceExtension = NULL;
+    
+    if (!DeviceObject || !Irp) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    if (!deviceExtension) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
     GPU_LOG_SIMPLE(DEBUG_VERBOSE, "Cleanup request received");
     
     Irp->IoStatus.Status = STATUS_SUCCESS;
@@ -118,8 +212,22 @@ NTSTATUS GpuCleanup(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 // Power handler
 NTSTATUS GpuPower(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
-    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    PDEVICE_EXTENSION deviceExtension = NULL;
+    PIO_STACK_LOCATION irpStack = NULL;
+    
+    if (!DeviceObject || !Irp) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    if (!deviceExtension) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    irpStack = IoGetCurrentIrpStackLocation(Irp);
+    if (!irpStack) {
+        return STATUS_INVALID_PARAMETER;
+    }
     
     GPU_LOG(DEBUG_VERBOSE, "Power IRP received: %d", irpStack->MinorFunction);
     
@@ -131,7 +239,16 @@ NTSTATUS GpuPower(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 // System control handler
 NTSTATUS GpuSystemControl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
-    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PDEVICE_EXTENSION deviceExtension = NULL;
+    
+    if (!DeviceObject || !Irp) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    if (!deviceExtension) {
+        return STATUS_INVALID_PARAMETER;
+    }
     
     GPU_LOG_SIMPLE(DEBUG_VERBOSE, "System control IRP received");
     
@@ -143,9 +260,23 @@ NTSTATUS GpuSystemControl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 // PnP handler
 NTSTATUS GpuPnP(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
-    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    PDEVICE_EXTENSION deviceExtension = NULL;
+    PIO_STACK_LOCATION irpStack = NULL;
     NTSTATUS status = STATUS_SUCCESS;
+    
+    if (!DeviceObject || !Irp) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    if (!deviceExtension) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    irpStack = IoGetCurrentIrpStackLocation(Irp);
+    if (!irpStack) {
+        return STATUS_INVALID_PARAMETER;
+    }
     
     GPU_LOG(DEBUG_INFO, "PnP IRP received: %d", irpStack->MinorFunction);
     
